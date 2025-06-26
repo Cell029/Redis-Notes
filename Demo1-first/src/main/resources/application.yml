@@ -1,0 +1,19 @@
+spring:
+  data:
+    redis:
+      host: 172.23.14.3
+      port: 6379
+      password: wyt131551
+      timeout: 10s
+      lettuce:
+        pool:
+          enabled: true
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+          max-wait: 1s
+
+
+logging:
+  level:
+    org.springframework.data.redis: DEBUG

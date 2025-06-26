@@ -537,6 +537,211 @@ void tearDown() {
 Jedis 本身是线程不安全的，并且频繁的创建和销毁连接会有性能损耗，因此使用 Jedis 连接池([JedisConnectionFactory](./Demo1-first/src/main/java/com/cell/jedis/util/JedisConnectionFactory.java))代替 Jedis 的直连方式更安全。
 
 ****
+#### 3. SpringDataRedis 连接池
+
+##### 1. 概念
+
+Spring Data Redis 是 Spring 团队推出的数据访问模块，属于 Spring Data 项目的子模块之一，专门用于简化 Redis 的集成与操作。
+
+核心功能：
+
+- 多客户端支持：支持 Lettuce（默认，基于 Netty，异步线程安全） 和 Jedis（老牌，阻塞 IO，线程不安全）
+- RedisTemplate API：提供统一的 RedisTemplate 高级封装，简化数据读写操作
+- 发布/订阅模型：支持 Redis 的 Pub/Sub 机制，方便实现消息推送与订阅
+- 哨兵模式支持：内置支持 Redis 高可用架构中的 Sentinel（哨兵）配置
+- 响应式编程支持：基于 Lettuce，支持 Reactive 响应式数据操作
+- ...
+
+相关依赖：
+
+```xml
+<!--redis依赖-->
+<dependency>
+   <groupId>org.springframework.boot</groupId>
+   <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+<!--common-pool-->
+<dependency>
+   <groupId>org.apache.commons</groupId>
+   <artifactId>commons-pool2</artifactId>
+</dependency>
+```
+
+常用方法：
+
+```java
+// 存入字符串
+redisTemplate.opsForValue().set("key", "value");
+// 获取字符串
+String value = (String) redisTemplate.opsForValue().get("key");
+// 操作哈希
+redisTemplate.opsForHash().put("user", "name", "Tom");
+// 获取哈希所有字段
+redisTemplate.opsForHash().entries("user");
+// 操作列表
+redisTemplate.opsForList().leftPush("list", "item");
+// 发布消息
+redisTemplate.convertAndSend("channel", "message");
+```
+
+
+
+常见序列化配置：
+
+```yml
+spring:
+  data:
+    redis:
+      host: 172.23.14.3
+      port: 6379
+      password: wyt131551
+      timeout: 10s
+      lettuce:
+        pool:
+          enabled: true
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+          max-wait: 1s
+```
+
+****
+##### 2. 自定义序列化
+
+RedisTemplate 支持存储任意 Java 对象到 Redis（set 方法的第一个参数是 String，第二个是 Object），底层通过序列化机制将对象转为字节数组存储，所以实际写入 Redis 的内容是二进制字节数组，通过客户端工具查看时通常看到乱码，这种方式往往可读性较差
+
+可以通过自定义 RedisTemplate 的序列化方式来提升可读性：
+
+在原始的序列化方式中，传入的值会先进行判断是否为字节数组，然后再走 valueSerializer() 统一序列化流程
+
+```java
+byte[] rawValue(Object value) {
+  if (this.valueSerializer() == null && value instanceof byte[] bytes) {
+      return bytes;
+  } else {
+      return this.valueSerializer().serialize(value);
+  }
+}
+```
+valueSerializer() 是 RedisTemplate 配置的序列化器，比如默认 JdkSerializationRedisSerializer，通过 serializer.convert() ，实际上调用了序列化器内部的 serializeToByteArray()
+
+```java
+public byte[] serialize(@Nullable Object value) {
+   if (value == null) {
+      return SerializationUtils.EMPTY_ARRAY;
+   } else {
+      try {
+         return (byte[])this.serializer.convert(value);
+      } catch (Exception var3) {
+         Exception ex = var3;
+         throw new SerializationException("Cannot serialize", ex);
+      }
+   }
+}
+```
+
+通过方法名就可以看出在这里调用字节流的方式，将数据转换成字节数组并返回
+
+```java
+default byte[] serializeToByteArray(T object) throws IOException {
+  ByteArrayOutputStream out = new ByteArrayOutputStream(1024);
+  this.serialize(object, out); // 把对象序列化写入流
+  return out.toByteArray();
+}
+```
+
+而 RedisTemplate 中有这四个序列化器，
+
+```java
+@Nullable
+private RedisSerializer keySerializer = null; // 操作 Key 的序列化
+@Nullable
+private RedisSerializer valueSerializer = null; // 操作 Value 的序列化
+@Nullable
+private RedisSerializer hashKeySerializer = null; // Hash 结构 Key 的序列化
+@Nullable
+private RedisSerializer hashValueSerializer = null; // Hash 结构 Value 的序列化
+```
+
+当初始化时会默认构建一个 Jdk 的序列化器
+
+```java
+public void afterPropertiesSet() {
+    super.afterPropertiesSet();
+    if (this.defaultSerializer == null) {
+        this.defaultSerializer = new JdkSerializationRedisSerializer(this.classLoader != null ? this.classLoader : this.getClass().getClassLoader());
+    }
+}
+```
+
+所以重写方法时，让这四个序列化器构建成可以将对象转换成 Json 格式的序列化器
+
+```java
+@Bean
+public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory){
+  // 创建RedisTemplate对象
+  RedisTemplate<String, Object> template = new RedisTemplate<>();
+  // 设置连接工厂
+  template.setConnectionFactory(connectionFactory);
+  // 创建 JSON 序列化工具
+  GenericJackson2JsonRedisSerializer jsonRedisSerializer =
+          new GenericJackson2JsonRedisSerializer();
+  // 设置 Key 的序列化，让 Key 存储为纯字符串，易于阅读、管理
+  template.setKeySerializer(RedisSerializer.string());
+  template.setHashKeySerializer(RedisSerializer.string());
+  // 设置 Value 的序列化，让 Value 转为 JSON 格式存储，兼顾可读性、跨语言兼容性、性能优化
+  template.setValueSerializer(jsonRedisSerializer);
+  template.setHashValueSerializer(jsonRedisSerializer);
+  // 返回
+  return template;
+}
+```
+
+****
+##### 3. 使用 StringRedisTemplate 手动序列化
+
+使用上面的自定义序列化的时候，会自动给对象存入一个路径的信息，就会导致占用更多的内存，为了节省内存就可以通过统一使用 String 序列化器，要求只能存储 String 类型的 key 和 value。
+当需要存储 Java 对象时，手动完成对象的序列化和反序列化。因为存入和读取时的序列化及反序列化都是手动实现的，SpringDataRedis 就不会将 class 信息写入 Redis 了。
+
+```json
+{
+  "@class": "com.cell.jedis.bean.User",
+  "name": "hahawuwu",
+  "age": 20
+}
+```
+
+```java
+@Autowired
+private StringRedisTemplate stringRedisTemplate;
+// JSON序列化工具
+private static final ObjectMapper mapper = new ObjectMapper();
+@Test
+void testSaveUser() throws JsonProcessingException {
+   // 创建对象
+   User user = new User("王五", 21);
+   // 手动序列化
+   String json = mapper.writeValueAsString(user);
+   // 写入数据
+   stringRedisTemplate.opsForValue().set("user:200", json);
+   // 获取数据
+   String jsonUser = stringRedisTemplate.opsForValue().get("user:200");
+   // 手动反序列化
+   User user1 = mapper.readValue(jsonUser, User.class);
+   System.out.println("user1 = " + user1);
+}
+```
+
+```json
+{
+  "name": "王五",
+  "age": 21
+}
+```
+
+****
+
+
 
 
 

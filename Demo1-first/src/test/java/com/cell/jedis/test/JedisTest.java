@@ -1,4 +1,4 @@
-package com.cell.test;
+package com.cell.jedis.test;
 
 import com.cell.jedis.util.JedisConnectionFactory;
 import org.junit.jupiter.api.AfterEach;
