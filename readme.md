@@ -54,7 +54,6 @@ db.users.find({ "orders.product": "手机" });
 
    - SQL：强事务，遵循ACID，保障数据可靠性
    - NoSQL：一般不支持强事务，强调最终一致性，部分提供弱事务，随没有 SQL 安全，但性能更高
-
 5. 其它差异
 
 存储介质：
@@ -76,7 +75,8 @@ db.users.find({ "orders.product": "手机" });
 
 关系型数据库：数据结构严谨，强一致性，适合规范化、支持事务保证线程安全；非关系型数据库：结构灵活、性能极致，适合海量数据、分布式、更适合高并发场景。
 
-****
+---
+
 ## 2. 认识 Redis
 
 ### 2.1 概念
@@ -105,7 +105,8 @@ Redis 的高性能来源：
 
 使用内存存储，读写速度远超磁盘（主要原因），且使用 IO 多路复用技术以此支持高并发。
 
-****
+---
+
 ### 2.2 安装 Redis
 
 本次安装使用的是 Windows 上的 Linux 子系统，通过使用 WSL2 进行模拟 Linux。
@@ -136,7 +137,7 @@ Redis 的高性能来源：
 然后输入 `redis-cli` 启动 Redis，此时输入界面变成 `127.0.0.1:6379>`，即默认绑定的 ip 和 端口号
 
 - 第五步：
- 
+
 修改一些配置，让登录更加方便安全。输入 `sudo nano /etc/redis/redis.conf` 编辑 Redis 配置文件，找到 bind 127.0.0.1 这一行，修改为：
 
 ```shell
@@ -170,7 +171,8 @@ OK
 127.0.0.1:6379[2]>
 ```
 
-****
+---
+
 ### 2.3 Redis 常见命令
 
 Redis是典型的key-value数据库，key一般是字符串，而value包含很多不同的数据类型。不同的数据类型对于不同的操作命令，
@@ -246,7 +248,8 @@ help @scripting    # Lua 脚本相关
   group: generic
 ```
 
-****
+---
+
 #### 2. String 类型
 
 String 是 Redis 最基本、最常用的数据类型，一个 key 对应一个 value，value 是字符串（实际底层可存储二进制数据），单个 String 最大存储 512MB；
@@ -316,7 +319,8 @@ set demo:product:1 '{"id":1,  "name": "小米11", "price": 4999}'
 
 并且，在 Redis 的桌面客户端中，还会以相同前缀作为层级结构，让数据看起来层次分明，关系清晰。
 
-****
+---
+
 #### 3. Hash 类型
 
 Redis 的 Hash 是典型的键值对集合结构，类似于 Java 中的 HashMap,每个 Hash 存储多个 field-value 对，适合用来存储对象、结构化数据，并i企鹅每个字段独立操作。
@@ -337,7 +341,8 @@ Hash 常用名利：
 - HINCRBY:让一个hash类型key的字段值自增并指定步长
 - HSETNX：添加一个hash类型的key的field值，前提是这个field不存在，否则不执行
 
-****
+---
+
 #### 4. List 类型
 
 Redis 中的 List 类型与 Java 中的 LinkedList 类似，可以看做是一个双向链表结构，既可以支持正向检索和也可以支持反向检索。特征也与LinkedList类似：
@@ -377,7 +382,8 @@ BLPOP task:queue 5
 - 队列：入口和出口反方向，即左近右出（右进左出）
 - 阻塞队列：入口和出口反方向，且出队时调用 BLPOP 或 BRPOP
 
-****
+---
+
 #### 5. Set 类型
 
 Redis 的 Set 结构与 Java 中的 HashSet 类似，可以看做是一个 value 为 null 的 HashMap（Set 不需要存元素对应的具体值，可以理解为 value 固定为 null），因为也是一个 hash 表，因此与 HashSet 有类似的特征：无序、元素不可重复（Set 的 元素不可重复等价于 HashMap 的 key 不可重复）、查找快等。
@@ -387,7 +393,6 @@ Redis 的 Set 结构与 Java 中的 HashSet 类似，可以看做是一个 value
 - 当执行 `SADD myset "a" "b"` 时，Redis 会把 "a"、"b" 作为哈希表的 key，对应的 value 固定填一个空值（类似 null）。
 - 此时哈希表的 key 唯一性就保证了 Set 的 元素不可重复。
 - 哈希表的快速查找特性（O (1) 复杂度），也让 Set 的 SISMEMBER（判断元素是否存在）操作非常高效。
-
 
 Set的常见命令有：
 
@@ -403,7 +408,8 @@ SADD user:1:tags "旅游" "摄影" "健身"
 SADD user:2:tags "旅游" "美食"
 ```
 
-****
+---
+
 #### 6. Sorted Set 类型
 
 Redis 的 SortedSet 是一个可排序的 set 集合，与 Java 中的 TreeSet 有些类似，但底层数据结构却差别很大。
@@ -424,7 +430,7 @@ SortedSet的常见命令有：
 
 注意：所有的排名默认都是升序，如果要降序则在命令的 Z 后面添加 REV 即可，例如：
 
-- **升序**获取 sorted set 中的指定元素的排名：ZRANK key member 
+- **升序**获取 sorted set 中的指定元素的排名：ZRANK key member
 - **降序**获取 sorted set 中的指定元素的排名：ZREVRANK key memeber
 
 ```shell
@@ -442,7 +448,8 @@ ZREVRANGE game:rank 0 2 WITHSCORES  # 获取前三
 6) "500"
 ```
 
-****
+---
+
 ## 3. Redis 的 Java 客户端
 
 ### 3.1 Jedis 客户端
@@ -531,12 +538,14 @@ void tearDown() {
 }
 ```
 
-****
+---
+
 #### 2. Jedis 连接池
 
 Jedis 本身是线程不安全的，并且频繁的创建和销毁连接会有性能损耗，因此使用 Jedis 连接池([JedisConnectionFactory](./Demo1-first/src/main/java/com/cell/jedis/util/JedisConnectionFactory.java))代替 Jedis 的直连方式更安全。
 
-****
+---
+
 #### 3. SpringDataRedis 连接池
 
 ##### 1. 概念
@@ -584,8 +593,6 @@ redisTemplate.opsForList().leftPush("list", "item");
 redisTemplate.convertAndSend("channel", "message");
 ```
 
-
-
 常见序列化配置：
 
 ```yml
@@ -605,7 +612,8 @@ spring:
           max-wait: 1s
 ```
 
-****
+---
+
 ##### 2. 自定义序列化
 
 RedisTemplate 支持存储任意 Java 对象到 Redis（set 方法的第一个参数是 String，第二个是 Object），底层通过序列化机制将对象转为字节数组存储，所以实际写入 Redis 的内容是二进制字节数组，通过客户端工具查看时通常看到乱码，这种方式往往可读性较差
@@ -623,6 +631,7 @@ byte[] rawValue(Object value) {
   }
 }
 ```
+
 valueSerializer() 是 RedisTemplate 配置的序列化器，比如默认 JdkSerializationRedisSerializer，通过 serializer.convert() ，实际上调用了序列化器内部的 serializeToByteArray()
 
 ```java
@@ -697,7 +706,8 @@ public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connec
 }
 ```
 
-****
+---
+
 ##### 3. 使用 StringRedisTemplate 手动序列化
 
 使用上面的自定义序列化的时候，会自动给对象存入一个路径的信息，就会导致占用更多的内存，为了节省内存就可以通过统一使用 String 序列化器，要求只能存储 String 类型的 key 和 value。
@@ -739,10 +749,30 @@ void testSaveUser() throws JsonProcessingException {
 }
 ```
 
+---
+
+## 二. 黑马点评项目
+
+### 1. 短信登录
+
+#### 1.1 基于 Session 实现登录流程
+
+发送验证码： [UserServiceImpl#sendCode](./hm-dianping/src/main/java/com/hmdp/service/impl/UserServiceImpl.java)
+
+- 用户在提交手机号后，会校验手机号是否合法，如果不合法，则要求用户重新输入手机号；
+- 如果手机号合法，后台就生成对应的验证码，同时将验证码进行保存，然后再通过短信的方式将验证码发送给用户（目前通过打印到日志模拟发送验证码）
+
+短信验证码注册、登录：[UserServiceImpl#login](./hm-dianping/src/main/java/com/hmdp/service/impl/UserServiceImpl.java)
+
+- 用户输入收到的验证码和手机号，后台从 session 中拿到当前验证码，然后和用户输入的验证码进行校验，如果不一致，则无法通过校验；
+- 如果一致，则后台根据手机号查询用户；
+- 当查询不到该手机号的用户时，就为该手机号创建用户账号信息并保存保存到数据库
+- 最后将用户信息保存到 session 中，方便后续从 session 中获取当前登录用户的信息
+
+校验登陆状态：[LoginInterceptor](./hm-dianping/src/main/java/com/hmdp/utils/LoginInterceptor.java)
+
+- 用户发送请求时，后台会创建 session，服务端返回响应时则会把 JSessionId 保存到服务端，所以服务端可以从 JSessionId 中获取到用户信息，
+- 如果没有获取到对应的信息，则进行拦截，
+- 如果获取到了，就将用户信息存到 ThreadLocal 中，而通过 Tomcat 的线程池复用技术，可以较为方便的获取到 ThreadLocal 中的数据，通常一种 ThreadLocal 存一种数据
+
 ****
-
-
-
-
-
-
