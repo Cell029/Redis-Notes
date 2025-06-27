@@ -16,6 +16,7 @@ spring:
       host: 172.23.14.3
       port: 6379
       password: 123
+      database: 0
       lettuce:
         pool:
           max-active: 10
