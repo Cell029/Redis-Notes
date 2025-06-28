@@ -994,6 +994,16 @@ redis 自动进行，当 redis 内存达到设定的 max-memery 的时候，会�
 在原代码的基础上进行了一些添加，当数据库没有查询到信息时，就将一个空值存入 redis 中，key 就用的当前查询的条件（shop#id）：
 
 ```java
+if (shop != null) {
+    if (shopJson.isEmpty()) {
+    // 命中空缓存，直接返回
+    System.out.println("命中空值缓存！");
+    return null;
+    }
+
+```
+            
+```java
 // 5. 如果不存在就返回错误信息
 if (shop == null) {
     // 将空值写入 redis
@@ -1103,8 +1113,55 @@ private void unlock(String key) {
 ```
 
 ****
+#### 2.8 基于逻辑过期解决缓存击穿问题
 
+解决缓存击穿：[ShopServiceImpl#queryWithLogicalExpire](./hm-dianping/src/main/java/com/hmdp/service/impl/ShopServiceImpl.java)
 
+当用户开始查询时，会判断是否命中缓存，如果命中则判断是否命中的为空缓存，如果不是则将 value 取出，判断 value 中的过期时间是否满足，
+如果没有过期，则直接返回 redis 中的数据，如果过期，则在开启独立线程后直接返回之前的数据，独立线程去重构数据缓存，重构完成后释放互斥锁。
+
+****
+#### 2.9 封装 Redis 工具
+
+* 方法1：将任意 Java 对象序列化为 json 并存储在 string 类型的 key 中，并且可以设置 TTL 过期时间
+
+[CacheClient#set](./hm-dianping/src/main/java/com/hmdp/utils/CacheClient.java)
+
+* 方法2：将任意 Java 对象序列化为 json 并存储在 string 类型的 key 中，并且可以设置逻辑过期时间，用于处理缓
+
+[CacheClient#setWithLogicalExpire](./hm-dianping/src/main/java/com/hmdp/utils/CacheClient.java)。
+
+存击穿问题：
+
+* 方法3：根据指定的 key 查询缓存，并反序列化为指定类型，利用缓存空值的方式解决缓存穿透问题
+
+[CacheClient#queryWithPassThrough](./hm-dianping/src/main/java/com/hmdp/utils/CacheClient.java)。因为该方法最终会返回一个对象，所以要根据调用者具体要使用的类型来判断返回类型，
+这就需要用到泛型，根据调用者传来的具体类型，然后使用 JSONUtil.toBean 转换成对应的具体对象，然后返回。
+
+```java
+public <R,ID> R queryWithPassThrough(String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
+}
+```
+
+```java
+return JSONUtil.toBean(json, type);
+```
+
+因为解决缓存穿透问题是先判断有无缓存，然后查询数据库再赋空值给缓存，所以这里涉及数据库的操作，但是工具类没有纳入 MyBatisPlus 的管理，所以不能直接查询到数据，
+只能通过调用者传入一个函数来查询。
+
+```java
+cacheClient.queryWithPassThrough(RedisConstants.CACHE_SHOP_KEY, id, Shop.class, shopId -> getById(shopId), RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
+
+R r = dbFallback.apply(id);
+```
+
+* 方法4：根据指定的 key 查询缓存，并反序列化为指定类型，需要利用逻辑过期解决缓存击穿问题
+
+[CacheClient#queryWithLogicalExpire](./hm-dianping/src/main/java/com/hmdp/utils/CacheClient.java)。该方法需要的参数与上面一致，不过因为代码逻辑的问题，
+需要注意多个泛型类型的返回值。
+
+****
 
 
 
