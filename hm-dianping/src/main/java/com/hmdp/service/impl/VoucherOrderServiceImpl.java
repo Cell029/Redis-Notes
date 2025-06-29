@@ -9,9 +9,13 @@ import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.service.IVoucherService;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
 import jakarta.annotation.Resource;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -25,6 +29,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private RedisIdWorker redisIdWorker;
     @Resource
     private ISeckillVoucherService seckillVoucherService;
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+    @Resource
+    private RedissonClient redissonClient;
 
     @Transactional
     @Override
@@ -73,11 +81,40 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         //return Result.ok(orderId);
 
         Long userId = UserHolder.getUser().getId();
-        synchronized (userId.toString().intern()) {
+        /*synchronized (userId.toString().intern()) {
             // 获取代理对象，事务提交后才会释放锁
             IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
             return proxy.createVoucherOrder(voucherId);
+        }*/
+
+        // 创建锁对象
+        // SimpleRedisLock simpleRedisLock = new SimpleRedisLock(stringRedisTemplate, "order:" + userId);
+
+        // 使用 Redisson 创建锁
+        RLock lock = redissonClient.getLock("lock:order:" + userId);
+
+        // 获取锁
+        // boolean isLock = simpleRedisLock.tryLock(1200);
+
+        // 可以设置三个参数，重试等待时间、超时时间、时间单位
+        boolean isLock = lock.tryLock();
+
+        // 判断是否获取锁成功
+        if (!isLock) {
+            // 获取锁失败，返回错误信息
+            return Result.fail("一个用户只能下一单！");
         }
+        try {
+            // 获取锁成功
+            // 获取代理对象，事务提交后才会释放锁
+            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+            return proxy.createVoucherOrder(voucherId);
+        } finally {
+            // simpleRedisLock.unlock();
+            lock.unlock();
+        }
+
+
     }
 
     @Transactional
