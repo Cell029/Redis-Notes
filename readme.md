@@ -2325,10 +2325,373 @@ public void createVoucherOrder(VoucherOrder voucherOrder) {
 
 以上通过 lua 前端管理抢购资格与阻塞队列和异步线程的搭配空值数据库数据更新的组合确实能在一定程度上提高运行效率，但是仍然存在一些问题，该案例中的阻塞队列使用的 JDK 内置的，
 也就是说使用的是 JVM 的内存来存储信息，在高并发的情况下可能导致 JVM 内存崩溃，所以提前设置了阻塞队列的大小，但是也可能存在不够用的情况；其次，这些存储在阻塞队列（内存）的信息并不一定安全，
-因为它不可能第一时间全部完成操作，所以存在内存崩溃时数据仍未写进数据库的情况，造成数据的丢失。
+因为它不可能第一时间全部完成操作，所以存在内存崩溃时数据仍未写进数据库的情况，造成数据的丢失，即异步操作时不具备原子性。
 
 ****
-#### 
+### 7. Redis 消息队列
+
+#### 7.1 概念
+
+消息队列就是存放消息的队列，由生产者将消息发送到队列，然后队列缓存消息，解耦生产与消费速度。最简单的消息队列模型包括3个角色：
+
+* 消息队列：存储和管理消息，也被称为消息代理（Message Broker）
+* 生产者：发送消息到消息队列
+* 消费者：从消息队列获取消息并处理消息
+
+在秒杀场景中就是：下单之后，利用 redis 去进行校验下单条件，再通过队列把消息发送出去，然后启动一个线程去消费这个消息，完成解耦，同时也加快响应速度。
+而存储在消息队列中的数据独立于 JVM 内存之外，并且不受阻塞队列的大小限制，所以会更适合当前的情况。
+
+1、基于 List 的消息队列实现
+
+队列是入口和出口不在一边，而基于 Redis 的 List 结构可以通过 LPUSH + BRPOP 或者 RPUSH + LPOP 的组合来简单高效地模拟出消息队列。
+不过要注意的是，当队列中没有消息时使用 RPOP 或 LPOP 操作会返回 null，并不像 JVM 的阻塞队列那样会阻塞并等待消息。
+因此这里应该使用 BRPOP 或者 BLPOP 来实现阻塞效果。
+
+优点：
+
+* 利用Redis存储，不受限于JVM内存上限
+* 基于Redis的持久化机制，数据安全性有保证
+* 可以满足消息有序性
+
+缺点：
+
+* 无法避免消息丢失（宕机时数据可能还没来得及处理）
+* 只支持单消费者（多消费者会打乱逻辑，导致 List 中元素混乱，影响业务正确性）
+
+2、基于 PubSub 的消息队列
+
+PubSub（发布订阅）是 Redis2.0 版本引入的消息传递模型，消费者可以订阅一个或多个 channel，生产者向对应 channel 发送消息后，订阅该 channel 的都能收到相关消息。
+
+```redis
+SUBSCRIBE channel [channel ...]   # 订阅一个或多个频道
+PUBLISH channel message           # 向指定频道发布消息
+PSUBSCRIBE pattern [pattern ...]  # 订阅匹配模式的所有频道（支持通配符）
+```
+
+例如：
+
+```redis
+publish order.queue msg1 # 在 order.queue 中发布信息 msg1
+subscribe  order.queue # 订阅 order.queue 
+psubscribe order.* # 订阅 order 下的所有
+```
+
+优点：
+
+* 采用发布订阅模型，支持多生产、多消费
+
+缺点：
+
+* 不支持数据持久化
+* 无法避免消息丢失
+* 消息堆积有上限，超出时数据丢失
+
+基于以上，实际使用中不如使用 List
+
+3、基于 Stream 的消息队列
+
+它是 Redis 5.0 版本引入的新型数据结构，支持多消费者、消费确认、消息持久化、消费回溯功能，是一个一个功能非常完善的消息队列。
+
+```redis
+XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] threshold [LIMIT count]] *|id field value [field value ...]
+summary: Appends a new message to a stream. Creates the key if it doesn't exist.
+```
+
+- [NOMKSTREAM]:如果队列不存在，默认自动创建一个
+- [MAXLEN|MINID [=|~] threshold [LIMIT count]]：设置消息队列的最大消息数
+- *|id：消息的唯一 ID，* 代表由 Redis 自动生成，格式是 `<时间戳>-<序列号>`，例如 1656580000000-0
+- field value [field value ...]：发送到消息队列的信息，称为 Entry，格式为多个 key-value 键值对
+
+例如：
+
+```redis
+XADD mystream * orderId 123 userId 456
+```
+
+- 插入 orderId:123, userId:456
+- 自动生成唯一消息 ID
+- 数据持久化存储
+
+```redis
+XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]
+```
+
+- [COUNT count]：每次读取信息的最大数量
+- [BLOCK milliseconds]：当没有消息时是否阻塞，阻塞时间是多少
+- STREAMS key [key ...]：要从哪个队列读取消息，key 就是队列名
+- id [id ...]：起始 id，只返回大于该 id 的消息；0：代表从第一个消息开始；$：代表从最新的消息开始
+
+例如：
+
+```redis
+XREADGROUP GROUP mygroup consumer1 COUNT 1 BLOCK 2000 STREAMS mystream >
+```
+
+- mygroup：消费组
+- consumer1：消费者名称
+- `>`：表示读取尚未消费的新消息
+- BLOCK 2000：阻塞等待 2 秒，无新消息自动返回
+
+注意：当指定起始 ID 为 $ 时，代表读取最新的消息，如果处理一条消息的过程中，又有超过 1 条以上的消息到达队列，则下次获取时也只能获取到最新的一条，会出现漏读消息的问题
+
+
+****
+#### 7.2 基于 Stream 的消息队列-消费者组
+
+消费者组（Consumer Group）：将多个消费者划分到一个组中，监听同一个队列，具备下列特点：
+
+1. 消息分流：
+
+队列中的消息会分流给组内的不同消费者，而不是重复消费，从而加快消费处理的速度
+
+2. 消息标示
+
+消费者组会维护一个标示，记录最后一个被处理的消息，哪怕消费者宕机重启，也依然会从标示之后开始读取信息，确保每一个消息都会被消费
+
+3. 消息确认
+
+消费者获取消息后，消息处于 pending 状态并会存入一个 pending-list。当消息处理完成后需要通过 XACK 来确认消息，标记消息为已处理，这样才会从 pending-list 中移除。
+
+创建消费者组：
+
+```redis
+XGROUP CREATE key groupName ID [MKSTREAM]
+```
+
+- key：队列名称（Stream 名称） 
+- groupName：消费者组名称，多个消费者共享一个组
+- ID：
+  - $：从最后一条消息开始（只消费新消息，常用） 
+  - 0：从第一条消息开始（消费所有历史消息）
+- MKSTREAM：若 Stream 不存在则自动创建
+
+例如：
+
+```redis
+XGROUP CREATE mystream mygroup $ MKSTREAM
+```
+
+- mystream：Stream 队列名称 
+- mygroup：消费者组名称
+- $：从最新消息开始消费 
+- MKSTREAM：如果 mystream 不存在，自动创建
+
+```text
+127.0.0.1:6379> XGROUP CREATE mystream mygroup $ MKSTREAM
+OK
+127.0.0.1:6379> XADD mystream * orderId 123 userId 456
+"1751290033062-0"
+```
+
+删除消费者组：
+
+```redis
+XGROUP DESTROY key groupName
+```
+
+例如：删除 mystream 队列下的 mygroup 消费者组，不影响队列中已有消息
+
+```redis
+XGROUP DESTROY mystream mygroup
+```
+
+手动创建消费者：这个命令通常不需要手动执行，XREADGROUP 时如果消费者不存在，系统会自动创建
+
+```redis
+XGROUP CREATECONSUMER key groupName consumerName
+```
+
+例如：
+
+```redis
+XGROUP CREATECONSUMER mystream mygroup consumer1
+```
+
+删除指定消费者：
+
+```redis
+XGROUP DELCONSUMER key groupName consumerName
+```
+
+例如：删除 mystream 队列下 mygroup 组的 consumer1 消费者信息，但仅删除消费者标记，未确认的 Pending 消息仍保留
+
+```redis
+XGROUP DELCONSUMER mystream mygroup consumer1
+```
+
+消费者组读取消息:
+
+```redis
+XREADGROUP GROUP groupName consumerName [COUNT count] [BLOCK ms] [NOACK] STREAMS key ID
+```
+
+* group：消费组名称
+* consumer：消费者名称，如果消费者不存在，会自动创建一个消费者
+* count：本次查询的最大数量
+* BLOCK milliseconds：当没有消息时最长等待时间
+* NOACK：无需手动ACK，获取到消息后自动确认
+* STREAMS key：指定队列名称
+* ID：获取消息的起始ID：
+  * ">"：从下一个未消费的消息开始
+  * 其它：根据指定id从pending-list中获取已消费但未确认的消息，例如0，是从pending-list中的第一个消息开始
+
+例如：只消费 mygroup 队列中的未消费的新消息，最多读取 2 条消息并最多阻塞等待 5 秒
+
+```redis
+XREADGROUP GROUP mygroup consumer1 COUNT 2 BLOCK 5000 STREAMS mystream >
+```
+
+```text
+127.0.0.1:6379> XREADGROUP GROUP mygroup consumer1 COUNT 2 BLOCK 5000 STREAMS mystream >
+1) 1) "mystream"
+   2) 1) 1) "1751290033062-0"
+         2) 1) "orderId"
+            2) "123"
+            3) "userId"
+            4) "456"
+```
+
+手动确认消息：
+
+```redis
+XACK mystream mygroup 1657000000000-0
+```
+
+- mystream：队列名 
+- mygroup：消费者组 
+- 1657000000000-0：消息 ID
+
+确认消费完成后，消息从 Pending-List 移除
+
+查看未确认消息：
+
+```redis
+XPENDING mystream mygroup
+```
+
+使用消费组的优点：
+
+1、消息可回溯
+
+Redis Stream 内部结构类似时间线，所有消息严格有序存储，并且消息不会因消费而立即删除，后续可以通过指定消息 ID，任意时刻读取历史消息，例如：
+
+```redis
+# 从 ID 为 0 开始读取，意味着回溯消费全部历史消息
+XREADGROUP GROUP mygroup consumer STREAMS mystream 0
+```
+
+2、多消费者争抢消息，加快消费速度
+
+Redis Stream 支持消费组模式，在同一个消费组下可以有多个消费者并发消费同一队列，而 Redis 会自动做消息分配，保证每条消息只被一个消费者处理：
+
+```redis
+# 同时获取最新的未消费消息，但获取的消息随机
+XREADGROUP GROUP mygroup consumer1 STREAMS mystream >
+XREADGROUP GROUP mygroup consumer2 STREAMS mystream >
+```
+
+3、可以阻塞读取，利用 BLOCK 自定义阻塞时间，模拟阻塞队列效果
+
+4、没有消息漏读的风险
+
+消息被消费者读取后，Redis 并不删除消息，未确认的消息保存在 Pending-List， 即使消费者异常、宕机，消息仍保留，可通过 XPENDING 查看未确认的消息
+
+5、消息确认机制的存在保证了消息至少会被消费一次
+
+
+****
+#### 7.3 基于 Redis 的 Stream 结构作为消息队列实现异步秒杀下单
+
+需求：
+
+* 创建一个Stream类型的消息队列，名为stream.orders
+* 修改之前的秒杀下单 Lua 脚本，在认定有抢购资格后，直接向 stream.orders 中添加消息，内容包含 voucherId、userId、orderId（避免直接使用 Java 代码向 redis 中发送数据）
+* 项目启动时，开启一个线程任务，尝试获取 stream.orders 中的消息，完成下单
+
+修改 lua 脚本，新增执行语句：
+
+```lua
+-- 发送消息到队列中， XADD stream.orders * k1 v1 k2 v2 ...
+redis.call('xadd', 'stream.orders', '*', 'userId', userId, 'voucherId', voucherId, 'id', orderId)
+```
+
+因为现在使用的是 Redis 的 Stream 结构作为消息队列，所以可以不再使用阻塞队列来存储数据，但依然需要异步线程来提高执行效率。异步线程中执行的内容发生了较大的变化，
+但后续流程仍需要 lua 脚本中返回的值（0，1，2）来判断用户当前订单情况，以提前返回正确的信息。如 [VoucherOrderServiceImpl#seckillVoucher](./hm-dianping/src/main/java/com/hmdp/service/impl/VoucherOrderServiceImpl.java)方法，
+在以前的版本需要创建一个 VoucherOrder 对象，然后封装 orderId、userId、voucherId，现在就不用了，因为 lua 脚本中将 'userId', userId, 'voucherId', voucherId, 'id', orderId 信息放在了队列中，
+所以它就需要通过 read() 方法读取信息，该方法有三个参数，第一个包装消息组的信息（消费组名和消费者名），第二个包装读取时的操作（读几条、阻塞多久），第三个包装消息队列的信息（队列名、从第几条开始读）。
+
+而该方法的主要逻辑就是通过消费组的特性模拟阻塞队列，然后解析获取到的信息（类似 Map 集合的操作），最重要的是它要进行确认，因为消费组从队列中获取到消息后不会立即删除，
+消息会进入 pending-list（待确认消息列表），如果不确认，该消息可能被 Redis 误认为未完成消息，该消息就可能会被其他消费者获取到，造成数据的紊乱。
+
+```java
+private class VoucherOrderHandler implements Runnable {
+String queueName = "stream.orders";
+
+@Override
+public void run() {
+    while (true) {
+        try {
+            // 1. 获取消息队列中的订单信息：XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS streams.order >
+            List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                    Consumer.from("g1", "c1"),
+                    StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
+                    StreamOffset.create(queueName, ReadOffset.lastConsumed())
+            );
+            // 2. 判断消息获取是否成功
+            if (list == null || list.isEmpty()) {
+                continue;
+            }
+            // 3. 解析消息中的信息
+            MapRecord<String, Object, Object> entries = list.get(0);
+            Map<Object, Object> values = entries.getValue();
+            VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
+            // 4. 从消息队列中成功获取消息，开始创建订单
+            handleVoucherOrder(voucherOrder);
+            // 5. 进行 ACK 确认:XACK stream.order g1 id
+            stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", entries.getId());
+        } catch (Exception e) {
+            log.error("处理订单异常", e);
+            // 当发生异常证明消息没有进行 ACK 确认，就要进 pending-list 中进行确认
+            handlePendingList();
+        }
+    }
+}
+```
+
+所以如果发生了异常导致消息没法主动确认时，就需要在异常处理的时候进行二次确认，避免上述情况发生，当然这里不用一直重复尝试获取 pending-list 中的信息，
+因为第一次获取失败证明发生异常时上面的程序还没来得及读取信息，所以直接结束循环跳出方法，通过这种机制可以很大程度上保证 lua 脚本返回成功信息与同步数据库的原子性。
+
+```java
+private void handlePendingList() {
+    while (true) {
+        try {
+            // 1. 获取 pending-list 中的订单信息：XREADGROUP GROUP g1 c1 COUNT 1 STREAMS streams.order 0
+            List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                    Consumer.from("g1", "c1"),
+                    StreamReadOptions.empty().count(1),
+                    StreamOffset.create(queueName, ReadOffset.from("0"))
+            );
+            // 2. 判断消息获取是否成功
+            if (list == null || list.isEmpty()) {
+                // 获取失败，证明 pending-list 中没有异常消息，结束循环
+                break;
+            }
+            // 3. 解析消息中的信息
+            MapRecord<String, Object, Object> entries = list.get(0);
+            Map<Object, Object> values = entries.getValue();
+            VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
+            // 4. 从消息队列中成功获取消息，开始创建订单
+            handleVoucherOrder(voucherOrder);
+            // 5. 进行 ACK 确认:XACK stream.order g1 id
+            stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", entries.getId());
+        } catch (Exception e) {
+            log.error("处理 pending-list 订单异常", e);
+        }
+    }
+}
+```
+
+****
 
 
 
