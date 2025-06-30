@@ -2045,7 +2045,290 @@ protected CompletionStage<Boolean> renewExpirationAsync(long threadId) {
 ```
 
 ****
+#### 5.4 Redisson 的 MutiLock 原理
 
+Redis 是一种多节点的技术，如果只给主节点添加锁，那么在分布式环境无法保障数据一致性与可靠性，所以需要在所有节点加上同一个锁，保证所有节点的数据一致性，防止并发冲突。
+
+可以看到 redissonClient.getMultiLock(....) 方法会进入以下方法，这个方法里面会把所有的锁添加进集合中，那很明显，后续要完成主从的一致，就需要从集合中取出所有的锁
+
+```java
+final List<RLock> locks = new ArrayList();
+
+public RedissonMultiLock(RLock... locks) {
+    if (locks.length == 0) {
+        throw new IllegalArgumentException("Lock objects are not defined");
+    } else {
+        this.locks.addAll(Arrays.asList(locks));
+    }
+}
+```
+
+```java
+public boolean tryLock() {
+    try {
+        return this.tryLock(-1L, -1L, (TimeUnit)null);
+    } catch (InterruptedException var2) {
+        Thread.currentThread().interrupt();
+        return false;
+    }
+}
+```
+
+这个 tryLock 源码就和上面的单个锁的不一样了，通过 tryLock 方法尝试依次获取多实例的锁，核心逻辑是所有节点必须全部加锁成功才算整体锁成功，若部分失败则释放已加锁节点并根据等待时间重试，
+同时加锁成功后会统一重置锁的有效期，如果方法执行成功，证明全局锁加锁成功
+
+```java
+public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) throws InterruptedException {
+    // 判断有没有传递手动设置的过期时间
+    long newLeaseTime = -1L;
+    // 如果手动设置了过期时间
+    if (leaseTime > 0L) {
+        // 如果手动设置了等待时间
+        if (waitTime > 0L) {
+            // 将过期时间设置为等待时间的两倍，防止还在重试等待中就自动释放了
+            newLeaseTime = unit.toMillis(waitTime) * 2L;
+        } else {
+            // 没设置等待时间，那就用手动设置的过期时间
+            newLeaseTime = unit.toMillis(leaseTime);
+        }
+    }
+    long time = System.currentTimeMillis();
+    long remainTime = -1L;
+    if (waitTime > 0L) {
+        remainTime = unit.toMillis(waitTime);
+    }
+    // 计算锁的等待时间，这个方法就是直接把剩余时间传回
+    long lockWaitTime = this.calcLockWaitTime(remainTime);
+    // 设置失败锁的限制，也就是 0 
+    int failedLocksLimit = this.failedLocksLimit();
+    // 遍历所有的锁
+    List<RLock> acquiredLocks = new ArrayList(this.locks.size());
+    ListIterator<RLock> iterator = this.locks.listIterator();
+    // 依次获取每一把锁
+    while(iterator.hasNext()) {
+        RLock lock = (RLock)iterator.next();
+        
+        boolean lockAcquired;
+        try {
+            if (waitTime <= 0L && leaseTime <= 0L) {
+                // 这个方法就是不传递参数的获取锁的方法，只进行获取一次
+                lockAcquired = lock.tryLock();
+            } else {
+                long awaitTime = Math.min(lockWaitTime, remainTime);
+                // 这个方法同理
+                lockAcquired = lock.tryLock(awaitTime, newLeaseTime, TimeUnit.MILLISECONDS);
+            }
+        } catch (RedisResponseTimeoutException var21) {
+            this.unlockInner(Arrays.asList(lock));
+            lockAcquired = false;
+        } catch (Exception var22) {
+            lockAcquired = false;
+        }
+        // 判断是否拿到锁
+        if (lockAcquired) {
+            // 成功就放到锁的集合中
+            acquiredLocks.add(lock);
+        } else {
+            // 获取锁失败，用锁的总数量（初始设置的）- 已经获取的锁的数量是否等于失败锁的限制（0）
+            if (this.locks.size() - acquiredLocks.size() == this.failedLocksLimit()) {
+                // 也就是说想跳出循环就必须锁的数量和已获取锁的数量一致
+                break;
+            }
+            if (failedLocksLimit == 0) {
+                this.unlockInner(acquiredLocks);
+                if (waitTime <= 0L) {
+                    // 如果没有设置等待时间，证明不想重试获取锁，那么一次获取失败就结束程序
+                    return false;
+                }
+                failedLocksLimit = this.failedLocksLimit();
+                acquiredLocks.clear();
+                while(iterator.hasPrevious()) {
+                    // 指针前置
+                    iterator.previous();
+                }
+            } else {
+                --failedLocksLimit;
+            }
+        }
+        // 如果还有剩余时间存在
+        if (remainTime > 0L) {
+            remainTime -= System.currentTimeMillis() - time;
+            time = System.currentTimeMillis();
+            // 如果以上操作把等待时间耗尽了，就证明没有机会获取下一把锁了
+            if (remainTime <= 0L) {
+                // 释放锁
+                this.unlockInner(acquiredLocks);
+                return false;
+            }
+        }
+    }
+    // 判断是否手动设置了过期时间，如果手动设置了，那就重置锁的有效期
+    if (leaseTime > 0L) {
+        acquiredLocks.stream().map((l) -> (RedissonBaseLock)l).map((l) -> l.expireAsync(unit.toMillis(leaseTime), TimeUnit.MILLISECONDS)).forEach((f) -> f.toCompletableFuture().join());
+    }
+    return true;
+}
+```
+
+****
+### 6. 秒杀优化
+
+当前程序的下单流程：当用户发起请求，此时会请求 nginx，nginx 会访问到 tomcat，而 tomcat 中的程序，会进行串行操作，分成如下几个步骤：
+
+1. 查询优惠卷 
+2. 判断秒杀库存是否足够 
+3. 查询订单 
+4. 校验是否是一人一单 
+5. 扣减库存 
+6. 创建订单
+
+在这六步操作中，又有很多操作是要去操作数据库的，而且还是一个线程串行执行， 这样就会导致程序执行的很慢，所以需要异步程序执行，开启多个线程，一个线程执行查询优惠卷，
+一个执行判断扣减库存，一个去创建订单等等，然后在做统一的返回，虽然这样做看上去可以并行的执行操作，但操作之间存在数据强依赖，没有库存订单根本不能创建，所以即使多线程拆开，
+最终还是得汇总各步骤结果。
+
+于是可以将耗时比较短的逻辑判断放入到 redis 中，比如是否库存足够，比如是否一人一单，只要这种逻辑可以完成，就意味着一定可以下单完成，然后只需要进行快速的逻辑判断，
+根本就不用等下单逻辑走完，就可以直接给用户返回成功信息，然后再在后台开一个线程，让后台线程慢慢的去执行。因为存在一人一单这种限制，所以将用户信息存入 redis 时可以考虑使用 set 结构，
+确保信息不能重复，即保证一人一单。
+
+当用户下单之后，判断库存是否充足只需要到 redis 中根据 key 找对应的 value 是否大于 0 即可，如果小于 0，证明库存不足，直接结束，
+如果大于 0，继续在 redis 中判断用户是否可以下单，如果 set 集合中没有这条数据，说明他可以下单，并将 userId 和优惠卷存入到 redis 中，整个过程需要保证是原子性的，可以使用 lua 来操作。
+
+需求：
+
+* 新增秒杀优惠券的同时，将优惠券信息保存到Redis中
+* 基于Lua脚本，判断秒杀库存、一人一单，决定用户是否抢购成功
+
+使用 [lua](./hm-dianping/src/main/resources/seckill.lua) 脚本即可完成上述两个需求，根据 lua 脚本返回的值来判断是否具有购买资格（0 即可以购买）
+
+* 如果抢购成功，将优惠券id和用户id封装后存入阻塞队列
+* 开启线程任务，不断从阻塞队列中获取信息，实现异步下单功能
+
+剩下两个需求则需要用到阻塞队列来完成，因为当没有值存在队列中时，阻塞队列就不会不会运行，避免长时间占用资源。
+
+当用户点击优惠秒删卷后，进入该方法，通过 lua 脚本判断是否有资格购买秒杀卷（即第一次购买或尚有库存），判断为有资格后将订单信息放入阻塞队列中，让它异步进行后续对数据库的操作，
+此时则可以直接将购买成功的信息返回给前端。
+
+```java
+@Override
+public Result seckillVoucher(Long voucherId) {
+    Long userId = UserHolder.getUser().getId();
+    // 获取订单 ID
+    long orderId = redisIdWorker.nextId("order");
+    // 1. 执行lua脚本
+    Long result = stringRedisTemplate.execute(
+            SECKILL_SCRIPT,
+            Collections.emptyList(), // 因为没有 KEYS，所以传一个空集合
+            voucherId.toString(), userId.toString(), String.valueOf(orderId) // 其他类型参数，即 ARGS
+    );
+    int r = result.intValue();
+    // 2. 判断结果是否为0
+    if (r != 0) {
+        // 2. 不为0 ，代表没有购买资格
+        return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
+    }
+    // 有购买资格，把下单信息保存到阻塞队列
+    VoucherOrder voucherOrder = new VoucherOrder();
+    voucherOrder.setId(orderId);
+    voucherOrder.setUserId(userId);
+    voucherOrder.setVoucherId(voucherId);
+    // 放入阻塞队列
+    orderTasks.add(voucherOrder);
+    // 获取代理对象
+    proxy = (IVoucherOrderService) AopContext.currentProxy();
+    // 3. 返回订单id
+    return Result.ok(orderId);
+}
+```
+
+阻塞队列本质只是数据结构，它是是一个线程安全的队列，所以它本身是不主动消费数据的，必须要有消费线程数据才会被处理，当队列里没有数据时，orderTasks.take() 方法就会原地等待，直到数据出现。
+
+```java
+// 定义了一个阻塞队列，用于存放 VoucherOrder 对象，队列容量是 1024 * 1024 = 1048576，即大约存放这么多个元素
+private BlockingQueue<VoucherOrder> orderTasks = new ArrayBlockingQueue<>(1024 * 1024);
+// 异步处理线程池
+private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+// 当前类初始化完成后开始执行
+@PostConstruct
+private void init() {
+    SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+}
+
+private class VoucherOrderHandler implements Runnable {
+    @Override
+    public void run() {
+        while (true){
+            try {
+                // 1. 获取队列中的订单信息（获取队列头）
+                VoucherOrder voucherOrder = orderTasks.take();
+                // 2. 创建订单
+                handleVoucherOrder(voucherOrder);
+            } catch (Exception e) {
+                log.error("处理订单异常", e);
+            }
+        }
+    }
+}
+
+// 线程内部处理订单流程
+private void handleVoucherOrder(VoucherOrder voucherOrder) {
+    // 1. 获取用户
+    Long userId = voucherOrder.getUserId();
+    // 2. 创建锁对象
+    RLock lock = redissonClient.getLock("lock:order:" + userId);
+    // 3. 尝试获取锁
+    boolean isLock = lock.tryLock();
+    // 4. 判断是否获得锁成功
+    if (!isLock) {
+        // 获取锁失败，直接返回失败或者重试
+        log.error("不允许重复下单！");
+        return;
+    }
+    try {
+        // 注意：由于是 spring 的事务是放在 threadLocal 中，而此时的是多线程，事务会失效
+        proxy.createVoucherOrder(voucherOrder);
+    } finally {
+        // 释放锁
+        lock.unlock();
+    }
+}
+```
+
+需要注意的是：创建订单信息时不能和之前一样直接通过 UserHolder 获取用户信息，因为用户信息是存储在线程 ThreadLocal 中的，而创建订单的方法是在子线程中执行的，
+所以直接通过它会获取到错误的信息，所以传递参数时不能再传递一个 orderId，而是直接把整个 VoucherOrder 传递过来，从阻塞队列中已经包装好的对象里获取
+
+```java
+@Transactional
+public void createVoucherOrder(VoucherOrder voucherOrder) {
+    // Long userId = UserHolder.getUser().getId();
+    Long userId = voucherOrder.getUserId();
+    // 查询订单
+    Long count = query().eq("user_id", userId).eq("voucher_id", voucherOrder.getVoucherId()).count();
+    // 判断是否存在
+    if (count > 0) {
+        // 用户已经购买过了
+        log.error("用户已经购买过一次！");
+        return;
+    }
+    // 6. 扣减库存
+    boolean success = seckillVoucherService.update()
+            .setSql("stock = stock - 1") // set stock = stock - 1
+            .eq("voucher_id", voucherOrder.getVoucherId()).gt("stock", 0) // where id = ? and stock > 0
+            .update();
+    if (!success) {
+        // 扣减失败
+        log.error("库存不足！");
+        return;
+    }
+    save(voucherOrder);
+}
+```
+
+以上通过 lua 前端管理抢购资格与阻塞队列和异步线程的搭配空值数据库数据更新的组合确实能在一定程度上提高运行效率，但是仍然存在一些问题，该案例中的阻塞队列使用的 JDK 内置的，
+也就是说使用的是 JVM 的内存来存储信息，在高并发的情况下可能导致 JVM 内存崩溃，所以提前设置了阻塞队列的大小，但是也可能存在不够用的情况；其次，这些存储在阻塞队列（内存）的信息并不一定安全，
+因为它不可能第一时间全部完成操作，所以存在内存崩溃时数据仍未写进数据库的情况，造成数据的丢失。
+
+****
+#### 
 
 
 
