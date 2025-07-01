@@ -2692,15 +2692,594 @@ private void handlePendingList() {
 ```
 
 ****
+### 8. 达人探店
+
+#### 8.1 查看探店笔记与点赞功能
+
+查看探店笔记，通过数据库获取到 Blog 的信息，即返回一个封装好的 Blog 对象给前端
+
+```java
+@Override
+public Result queryById(Long id) {
+    // 1. 查询 blog
+    Blog blog = getById(id);
+    if (blog == null) {
+        return Result.fail("笔记不存在！");
+    }
+    // 2. 查询 blog 相关用户
+    queryBlogUser(blog);
+    // 3. 查询 blog 是否已点赞
+    isBlogLiked(blog);
+    return Result.ok(blog);
+}
+
+private void queryBlogUser(Blog blog) {
+    Long userId = blog.getUserId();
+    User user = userService.getById(userId);
+    blog.setName(user.getNickName());
+    blog.setIcon(user.getIcon());
+}
+```
+
+初始的点赞功能只是简单的给 Blog 设置了一个字段，只要有用户点赞了，这个字段就会 +1，但是这种方式会导致一个用户可以给一片笔记点无限个赞，这是需要避免的，
+所以需要给 Blog 添加一个新的字段 isLike 用来标示当前用户是否已点赞（true 则已点赞），可以利用 Redis 的 set 集合判断是否点赞过，把已点赞的用户的信息放到 set 集合中，
+然后每次查询笔记时（即加载页面时）会去判断 set 集合中是否存在当前用户的信息，如果存在证明点赞了，就高亮点赞标识。
+
+```java
+// 每次加载首页时会进入此方法
+@Override
+public Result queryHotBlog(Integer current) {
+    // 根据用户查询
+    Page<Blog> page = query()
+            .orderByDesc("liked")
+            .page(new Page<>(current, SystemConstants.MAX_PAGE_SIZE));
+    // 获取当前页数据
+    List<Blog> records = page.getRecords();
+    // 查询用户
+    records.forEach(blog ->{
+        queryBlogUser(blog);
+        isBlogLiked(blog);
+    });
+    return Result.ok(records);
+}
+```
+
+```java
+private void isBlogLiked(Blog blog) {
+    // 1. 获取登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2. 判断当前登录用户是否已经点赞
+    String key = RedisConstants.BLOG_LIKED_KEY + blog.getId();
+    Boolean isMember = stringRedisTemplate.opsForSet().isMember(key, userId.toString());
+    // 为 true 证明已经点过赞了
+    blog.setIsLike(BooleanUtil.isTrue(isMember));
+}
+```
+
+用户的点赞逻辑则是：先判断谋篇笔记是否已点赞，没点赞的就可以点，修改数据库的信息，然后将该用户的信息存到 Redis 的 set 集合中，
+如果对已点赞的笔记再点以此就是取消点赞，那么不仅要修改数据库，还要从 Redis 中找到 set 集合中对应的本用户的信息，然后删除。
+
+```java
+ @Override
+public Result likeBlog(Long id) {
+    // 1. 获取登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2. 判断当前登录用户是否已经点赞
+    String key = RedisConstants.BLOG_LIKED_KEY + id;
+    Boolean isMember = stringRedisTemplate.opsForSet().isMember(key, userId.toString());
+    if (BooleanUtil.isFalse(isMember)) {
+        // 3. 如果未点赞，则该用户可以点赞
+        // 数据库点赞数+1
+        boolean isSuccess = update().setSql("liked = liked + 1").eq("id", id).update();
+        // 保存用户信息到 Redis 的 set 集合，以此作为已点赞
+        if (isSuccess) {
+            stringRedisTemplate.opsForSet().add(key, userId.toString());
+        }
+    } else {
+        // 4. 如果已点赞，取消点赞
+        // 数据库点赞数-1
+        boolean isSuccess = update().setSql("liked = liked - 1").eq("id", id).update();
+        // 把用户从 Redis 的 set 集合移除
+        if (isSuccess) {
+            stringRedisTemplate.opsForSet().remove(key, userId.toString());
+        }
+    }
+    return Result.ok();
+}
+```
+
+****
+#### 8.2 点赞排行榜
+
+因为要设置点赞的排行榜，让先点赞的人显示在前面，所以就不能再使用上面的那种 set 集合的方式，因为 set 集合虽然保证数据唯一，但无法排序，所以可以使用 sortedset 集合，
+它既保证了数据的唯一，也能根据 score 的值进行排序，所以只需要把点赞的时间作为 score，即可完成排序。
+
+在原有的基础上把 set 集合判断是否点赞的代码换成 sortedset 的，后续根据 score 是否为 null 判断有无点赞
+
+```java
+// Boolean isMember = stringRedisTemplate.opsForSet().isMember(key, userId.toString());
+Double score = stringRedisTemplate.opsForZSet().score(key, user.getId().toString());
+```
+
+查询点赞排序列表返回给前端，需要注意的是 mybatisplus 使用的查询是 in 的方式，需要在后面拼接 order by 来手动设置查询结果的先后顺序（依照 sortedset 中的数据的先后）
+
+```java
+@Override
+public Result queryBlogLikes(Long id) {
+    String key = RedisConstants.BLOG_LIKED_KEY + id;
+    // 1. 查询 top5 的点赞用户 zrange key 0 4
+    Set<String> top5 = stringRedisTemplate.opsForZSet().range(key, 0, 4);
+    if (top5 == null || top5.isEmpty()) {
+        return Result.ok(Collections.emptyList());
+    }
+    // 2. 解析出其中的用户 id
+    List<Long> ids = top5.stream().map(Long::valueOf).collect(Collectors.toList());
+    String idStr = StrUtil.join(",", ids); // 在 id 后面拼接 ','
+    // 因为查询语句用的是 in，所以最终查出的数据可能与真实的插入顺序无关，所以需要手动设置最后的排序，让 sorted 前面的数据做头
+    // 3. 根据用户 id 查询用户 WHERE id IN ( 5 , 1 ) ORDER BY FIELD(id, 5, 1)
+    List<UserDTO> userDTOS = userService.query()
+            .in("id", ids)
+            .last("ORDER BY FIELD(id," + idStr + ")").list() // 在后面拼接，手动设置排序
+            .stream()
+            .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+            .collect(Collectors.toList());
+    // 4.返回
+    return Result.ok(userDTOS);
+}
+```
+
+****
+### 9. 好友关注
+
+#### 9.1 关注与取消关注
+
+基于 tb_follow 表数据结构，关联当前用户与关注者的 ID，当某用户点击关注时，关联操作者的 ID 与该篇笔记的作者的 ID 到这张表中，取消关注则根据两人的 ID 作为条件查询数据库中是否存在该条记录，
+存在就直接删掉这条记录。
+
+```java
+// 关注
+public Result follow(Long followUserId, Boolean isFollow) {
+    // 1. 获取登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2. 判断到底是关注还是取关
+    if (isFollow) {
+        // 关注，新增数据
+        Follow follow = new Follow();
+        follow.setUserId(userId);
+        follow.setFollowUserId(followUserId);
+        save(follow);
+    } else {
+        // 3. 取关，删除 delete from tb_follow where user_id = ? and follow_user_id = ?
+        Map<String, Object> condition = new HashMap<>();
+        condition.put("user_id", userId);
+        condition.put("follow_user_id", followUserId);
+        removeByMap(condition);
+    }
+    return Result.ok();
+}
+
+public Result isFollow(Long followUserId) {
+    // 1. 获取登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2. 查询是否关注 select count(*) from tb_follow where user_id = ? and follow_user_id = ?
+    Long count = query().eq("user_id", userId).eq("follow_user_id", followUserId).count();
+    return Result.ok(count > 0);
+}
+```
+
+****
+#### 9.2 共同关注列表
+
+可以利用 Redis 中的 set 数据结构实现共同关注功能，它有个求交集的命令，可以筛选出两个 set 集合中共有的元素，所以在某位用户关注了某个作者时，需要将作者的 id 放进 set 集合，
+用当前用户的 id 作为 set 集合的 key，后面查看某个作者的页面时则通过 SINTER 判断这两个人的 set 集合是否有交集，有就把交集取出，封装成详细对象
+
+```java
+public Result follow(Long followUserId, Boolean isFollow) {
+    // 关注成功，把被关注用户的 id 放入 redis 的 set 集合中 sadd userId followerUserId
+    stringRedisTemplate.opsForSet().add(key, followUserId.toString());
+    // 取关， 把关注用户的 id 从 Redis 集合中移除
+    stringRedisTemplate.opsForSet().remove(key, followUserId.toString());
+}
+```
+
+前端访问用户共同关注列表时会访问该方法：
+
+```java
+public Result followCommons(Long id) {
+    // 1. 获取当前用户
+    Long userId = UserHolder.getUser().getId();
+    String key = "follows:" + userId;
+    // 2. 求当前用户与被关注者的 redis 的 set 集合中的交集
+    String key2 = "follows:" + id; // 传进来的 id 是被关注者的 id
+    Set<String> intersect = stringRedisTemplate.opsForSet().intersect(key, key2);
+    if (intersect == null || intersect.isEmpty()) {
+        // 无交集
+        return Result.ok(Collections.emptyList());
+    }
+    // 3. 解析 id 集合
+    List<Long> ids = intersect.stream().map(Long::valueOf).collect(Collectors.toList());
+    // 4.查询用户
+    List<UserDTO> users = userService.listByIds(ids)
+            .stream()
+            .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+            .collect(Collectors.toList());
+    return Result.ok(users);
+}
+```
+#### 9.3 Feed 流
+
+当我们关注了用户后，这个用户发了动态，那么我们应该把这些数据推送给用户，这个需求又被做 Feed 流，关注推送也叫做 Feed 流，直译为投喂。
+为用户持续的提供沉浸式的体验，通过无限下拉刷新获取新的信息。对于传统的模式的内容解锁，是需要用户去通过搜索引擎或者是其他的方式去解锁想要看的内容，
+对于新型的 Feed 流的的效果，则不需要用户再去推送信息，而是系统分析用户到底想要什么，然后直接把内容推送给用户，从而使用户能够更加的节约时间，不用主动去寻找。
+
+Feed 流的实现有两种模式：
+
+Timeline 模式，不做内容筛选，简单的按照内容发布时间排序，常用于好友或关注，例如朋友圈
+
+* 优点：信息全面，不会有缺失。并且实现也相对简单
+* 缺点：信息噪音较多，用户不一定感兴趣，内容获取效率低
+
+智能排序模式，利用智能算法屏蔽掉违规的、用户不感兴趣的内容，推送用户感兴趣信息来吸引用户
+
+* 优点：投喂用户感兴趣信息，用户粘度很高，容易沉迷
+* 缺点：如果算法不精准，可能起到反作用
+
+因为目前要实现的是基于关注的好友来实现 Feed 流，所以使用的是 Timeline 模式，该模式的实现方式如下：
+
+* 拉模式
+
+拉模式也叫做读扩散，当用户请求时，系统动态查询数据生成 Feed 流，也就是说发送者只需要发送一条数据到发件箱并附带时间，而有没有人接收取决于用户想不想拉取这条信息，
+所以该方法比较节约空间，但是可能存在延迟现象，因为当用户读取数据时才去关注的人里边拉取数据，如果该用户关注了大量的用户，那么此时就会拉取海量的内容，对服务器压力巨大。
+
+* 推模式
+
+该模式也叫做写扩散，发送者会给每个关注自己的人都发送一份信息，不需要用户手动拉取，虽然时效较快，但当关注者较多时就需要写很多分信息，导致内存压力增大
+
+* 推拉结合
+
+该模式也叫做读写混合，兼具推和拉两种模式的优点，它是一个折中的方案，如果发件人是个普通的人，那么就可以采用写扩散的方式，直接把数据写入到他的粉丝中去，因为普通的人他的粉丝关注量比较小，所以这样做没有压力，
+如果是大V，那么他是直接将数据先写入到一份到发件箱里边去（非活跃用户则需要主动拉取），然后再写一份到活跃粉丝收件箱里边去，
+对于用户来说，如果是活跃粉丝，那么大V和普通的人发的都会直接写入到自己收件箱里边来，而如果是普通的粉丝，由于上线不是很频繁，所以等他们上线时，需要再从发件箱里边去拉信息。
+
+
+****
+#### 9.4 推送消息到粉丝收件箱
+
+需求：
+
+* 修改新增探店笔记的业务，在保存 blog 到数据库的同时，推送到粉丝的收件箱
+* 收件箱满足可以根据时间戳排序，可以用 Redis 的 sortedset 结构实现
+* 查询收件箱数据时，可以实现分页查询
+
+在实现程序前需要知道的是：Feed 流的本质就是数据实时变化快，整体排序需要动态调整，所以在作者发布笔记时需要将笔记更新到 Redis 中用 sortedset 结构存储，以此达到最新消息在第一位的效果。
+查询信息的一种基础写法就是使用分页查询，根据发送的当前页数与提前设定的每页条数，决定当前页显示的内容，而接下来要进行的推送操作就是将最新的笔记作为第一条，所以原先的数据都需要后移，
+这就会导致本该第一页获取的内容结果移到了第二页，这就造成分页不稳定，所以应该采取新的分页方式。
+
+按照上面的流程，当作者成功新增笔记后，应该把当前笔记发送到每个粉丝的邮箱中，所以需要先通过数据库查询有哪些人关注了作者，然后用粉丝的 ID 作为 sortedset 集合的 key 存储在 redis 中充当邮箱，后续通过 redis 中的邮箱获取。
+
+```java
+public Result saveBlog(Blog blog) {
+    // 1. 获取登录用户
+    UserDTO user = UserHolder.getUser();
+    blog.setUserId(user.getId());
+    // 2. 保存探店笔记
+    boolean isSuccess = save(blog);
+    if(!isSuccess){
+        return Result.fail("新增笔记失败!");
+    }
+    // 3. 查询笔记作者的所有粉丝 select * from tb_follow where follow_user_id = ?
+    List<Follow> follows = followService.query().eq("follow_user_id", user.getId()).list();
+    // 4. 推送笔记 id 给所有粉丝
+    for (Follow follow : follows) {
+        // 获取粉丝 id
+        Long userId = follow.getUserId();
+        // 推送
+        String key = RedisConstants.FEED_KEY + userId;
+        stringRedisTemplate.opsForZSet().add(key, blog.getId().toString(), System.currentTimeMillis());
+    }
+    // 5.返回id
+    return Result.ok(blog.getId());
+}
+```
+
+传统的 sortedset 结构的分页查询通常依赖于元素下标，直接使用 ZRANGE 0 9 这类方式会导致无法处理动态更新的数据集，当内容更新时需要频繁的去寻找该条数据处于具体的哪个范围的下标，
+
+```redis
+ZRANGE key start stop [WITHSCORES]
+```
+
+而滚动分页不依赖固定页码，而是基于上一次查询的结果进行滚动式查询，因为是接收消息，所以可以使用 score（使用时间戳）来完成，通过上一次查询的最大与最小的 score 来选择分页，
+因为 sortedset 是天然带顺序的，所以处理起来比较方便，例如第一次查询时可以使用当前的时间作为最大的范围，然后以 0 作为最小范围，然后选择合适的条数获取数据，
+下一次查询就以上一次查询的最小值作为本次查询的最大值，最小值依然使用 0，然后选择合适的条数获取数据，以此类推...
+
+但需要注意的是，ZRANGE 命令有些需要注意的地方：
+
+```redis
+ZREMRANGEBYSCORE z1 1000 0 WITHSCORES LIMIT 0 3
+```
+
+这条命令的 0 和 3 代表从最大值的下 0 个开始获取，也就是从 1000 开始（包含）获取 3 挑，如果后面是 1 和 3，那么就是从最大值的下 1 个开始，也就是 999；
+其次如果上一次查询到的数据中有多个相同的 score 作为最小值的话，就需要从下 n 个（从开始获取到最后有几个相同的最小值就跳几个），例如：
+
+```redis
+1) "m8"
+2) "8"
+3) "m7"
+4) "6"
+5) "m6"
+6) "6"
+```
+
+上一次获取到的三个数中，最小值是 6，所以下一次的查询就需要从 6 开始然后 limit 2 ，因为 redis 是从头遍历找到第一个符合条件的返回，所以如果给的查询条件是 6，
+那么 redis 就会认为你要的 6 是第一个 6，所以下一次查询就要排除掉这两个已经被查过的 6，所以 limit 后面跟的是 2。
+
+具体流程如下，用户访问该页面后则会进入此方法，通过用户的 ID 从 sortedset 集合中获取所有的信息，先从当前时间开始获取，然后依次将最小时间传递给下一次查询请求，
+也就是向下翻找内容时，每一次新的请求都会使用上一次请求使用的最小时间作为本次请求的最大时间，同理，如果向上刷新的话，那就是一次全新的请求，从当前时间开始查找。
 
 
 
+```java
+public Result queryBlogOfFollow(Long max, Integer offset) {
+    // 1. 获取当前用户
+    Long userId = UserHolder.getUser().getId();
+    // 2. 查询收件箱 ZREVRANGEBYSCORE key Max Min LIMIT offset count
+    String key = RedisConstants.FEED_KEY + userId;
+    Set<ZSetOperations.TypedTuple<String>> typedTuples =
+            stringRedisTemplate.opsForZSet().reverseRangeByScoreWithScores(key, 0, max, offset, 2);
+    // 3. 非空判断
+    if (typedTuples == null || typedTuples.isEmpty()) {
+        return Result.ok();
+    }
+    // 4. 解析数据：blogId、minTime（时间戳）、offset
+    List<Long> ids = new ArrayList<>(typedTuples.size());
+    long minTime = 0;
+    int os = 1; // 计算本次获取的数据中有几个相同的最小值
+    for (ZSetOperations.TypedTuple<String> tuple : typedTuples) {
+        // 获取 id 并保存在 List 集合中，因为取出的东西是自带顺序的，所以添加进 List 的最后一个元素就是本次查询的最小值
+        ids.add(Long.valueOf(tuple.getValue()));
+        // 获取 score(时间戳）
+        long time = tuple.getScore().longValue();
+        // 判断当前遍历到的 score（时间戳）是否与最小 score 一致
+        if(time == minTime){
+            // 一致
+            os++;
+        }else{
+            // 不一致，跟新最小 score（时间戳）
+            minTime = time;
+            // 防止最小值前面有非最小的相同 score，所以出现不一致时重置偏移量为 1
+            os = 1;
+        }
+    }
+    if (offset > 1 && minTime == max) {
+        os = os + offset;
+    }
+    // 5. 根据 id 查询 blog
+    String idStr = StrUtil.join(",", ids); // 与之前的内容同理，mybatisplus 的查询用到了 in，所以要在后面拼接 order by 手动设置查询顺序
+    List<Blog> blogs = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
+    // 接收到推送后应该更新它的点赞与
+    for (Blog blog : blogs) {
+        // 查询 blog 有关的用户信息
+        queryBlogUser(blog);
+        // 查询 blog 是否被点赞
+        isBlogLiked(blog);
+    }
+    // 6. 封装并返回
+    ScrollResult r = new ScrollResult();
+    r.setList(blogs);
+    r.setOffset(os);
+    r.setMinTime(minTime);
+    return Result.ok(r);
+}
+```    
 
+本流程需要注意的是每一次偏移量的计算，因为存在多种情况：
 
+1. 正常情况，没有出现重复的 score，那么就走正常的流程，下一次的偏移量一定就是 1
 
+```java
+else{ // 进行重置 os
+    // 不一致，跟新最小 score（时间戳）
+    minTime = time;
+    // 防止最小值前面有非最小的相同 score，所以出现不一致时重置偏移量为 1
+    os = 1;
+}
+```
 
+2. 出现几个重复的最小值，那么就需要计算新的偏移量，偏移量设置为重复值的个数
 
+```java
+// 有相同的最小值，累加偏移量
+if(time == minTime){
+    // 一致
+    os++;
+}
+```
 
+3. 当本次查询的最大与最小都是相同的值时，并且上一次的重复的最小值不止一个，那么就需要本次计算的偏移量加上上次的偏移量作为下一次的偏移量
+
+```java
+// 当上一次的偏移量大于 1 时，证明上一次的查询中有不止一个相同的最小值，
+// 而同时本次查询的最大与最小 score 都相同时，证明这是好几个相同大小的值放在一块了
+// 所以再下一次的查找仍然是从这几个连续的相同的值开始
+// 所以设置的偏移量应该是本次使用的偏移量加上本次计算出来的最小相同值的个数
+if (offset > 1 && minTime == max) {
+    os = os + offset;
+}
+```
+
+****
+### 10. 附近商铺
+
+#### 10.1 GEO 基本用法
+
+GEO 就是 Geolocation 的简写形式，代表地理坐标。Redis 在 3.2 版本中加入了对 GEO 的支持，允许存储地理坐标信息，可以根据经纬度来检索数据。常见的命令有：
+
+* GEOADD：添加一个地理空间信息，包含：经度（longitude）、纬度（latitude）、值（member）
+
+```redis
+# 添加北京、上海、广州的坐标
+GEOADD cities:china 116.4074 39.9042 beijing 121.4737 31.2304 shanghai 113.2644 23.1261 guangzhou
+```
+
+* GEODIST：计算指定的两个点之间的距离并返回，默认单位是米，也可手动指定
+
+```redis
+# 计算北京到上海的距离（单位：千米）
+GEODIST cities:china beijing shanghai km
+# "1067.6112" km
+```
+
+* GEOHASH：将指定member的坐标转为hash字符串形式并返回
+
+```redis
+# 获取北京的GeoHash值
+GEOHASH cities:china beijing
+# "wx4g0bm6c40"
+```
+
+* GEOPOS：返回指定member的坐标，以二位数组的形式返回：[longitude, latitude]
+
+```redis
+# 获取上海的坐标
+GEOPOS cities:china shanghai
+# 1) 1) "121.47369772195816"
+#   2) "31.23039952570101"
+```
+
+* GEORADIUS：指定圆心、半径，找到该圆内包含的所有member，并按照与圆心之间的距离排序后返回。6.以后已废弃
+
+```redis
+# 查询北京周边100千米内的城市，按距离升序排列
+GEORADIUS cities:china 116.4074 39.9042 100 km WITHCOORD WITHDIST ASC
+# 只能查到本身（没添加周边城市）
+```
+
+* GEOSEARCH：在指定范围内搜索member，并按照与指定点之间的距离排序后返回。范围可以是圆形或矩形。6.2.新功能
+
+```redis
+# 圆形查询：上海周边200千米内的城市（默认排序是从距离近到远，也可也添加 SORT ASC|DESC 参数显式指定）
+GEOSEARCH cities:china BYRADIUS 121.4737 31.2304 200 KM WITHDIST
+
+# 127.0.0.1:6379> GEOSEARCH cities:china FROMMEMBER beijing BYRADIUS 200 km WITHDIST
+# 1) 1) "beijing" 匹配到的成员名
+# 2) "0.0000" 距离
+
+# 矩形查询：查询北京所在矩形区域内的城市
+GEOSEARCH cities:china FROMMEMBER beijing BYBOX 300 300 km WITHDIST
+```
+
+* GEOSEARCHSTORE：与 GEOSEARCH 功能一致，不过可以把结果存储到一个指定的 key， 6.2 新功能
+
+```redis
+# 查询广州周边150千米内的城市并存储结果
+GEOSEARCHSTORE nearby:guangzhou cities:china FROMLONLAT 113.2644 23.1261 BYRADIUS 150 km
+```
+
+****
+#### 10.2 添加并查询附近商户
+
+当点击美食之后，会出现一系列的商家，商家中可以按照多种排序方式，如果此时关注的是距离，那就需要使用到 GEO 向后台传入当前 app 收集的地址(此处是写死的) ，
+以当前坐标作为圆心，同时绑定相同的店家类型 type 以及分页信息，把这几个条件传入后台，后台查询出对应的数据再返回。
+
+所以需要将数据库表中的数据导入到 redis 中的 GEO，GEO 在 redis 中就一个 member 和一个经纬度，把 x 和 y 轴（经纬度）传入到 redis 的经纬度位置，
+但是不能把所有的数据都放入到 member 中去，毕竟作为 redis 是一个内存级数据库，如果存海量数据，redis 容易宕机，所以在这个地方存储店铺 id 即可。
+所以在 GEO 中，key 是店铺类型 id，value 是 店铺 id，score 是经纬度。
+
+```java
+void loadShopData() {
+    // 1. 查询店铺信息
+    List<Shop> list = shopService.list();
+    // 2. 把店铺分组，按照 typeId 分组，typeId 一致的放到一个集合
+    Map<Long, List<Shop>> map = list.stream().collect(Collectors.groupingBy(Shop::getTypeId));
+    // 3. 分批写入 Redis
+    for (Map.Entry<Long, List<Shop>> entry : map.entrySet()) {
+        // 获取类型 id
+        Long typeId = entry.getKey();
+        String key = SHOP_GEO_KEY + typeId;
+        // 获取同类型的店铺的集合
+        List<Shop> value = entry.getValue();
+        // GeoLocation<T> 是 Redis 提供的地理位置对象，用来封装经纬度和业务标识（member，这里是店铺 id）
+        List<RedisGeoCommands.GeoLocation<String>> locations = new ArrayList<>(value.size());
+        // 写入 redis: GEOADD key 经度 纬度 member
+        for (Shop shop : value) {
+            // stringRedisTemplate.opsForGeo().add(key, new Point(shop.getX(), shop.getY()), shop.getId().toString());
+            locations.add(new RedisGeoCommands.GeoLocation<>(
+                    shop.getId().toString(),
+                    new Point(shop.getX(), shop.getY())
+            ));
+        }
+        // 写入到 redis 的 GEO 中，店铺类型 id 作为 key
+        stringRedisTemplate.opsForGeo().add(key, locations);
+    }
+}
+```
+
+成功把数据库中的店铺信息存储到 redis 中后，则可以从 redis 中获取了，需要注意的是 GEO 是基于 Redis 的有序集合（Sorted Set）实现，本身并不直接提供传统数据库那样的 “页码 + 每页条数” 的分页能力，
+但可以通过 LIMIT 来模拟分页效果，不过因为店铺的更新不会像发邮件那样频繁，所以可以不用滚动式分页。
+
+```java
+public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+    // 1. 判断是否需要根据坐标查询
+    if (x == null || y == null) {
+        // 不需要坐标查询，按数据库查询
+        Page<Shop> page = query()
+                .eq("type_id", typeId)
+                .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+        // 返回数据
+        return Result.ok(page.getRecords());
+    }
+    // 2. 计算分页参数
+    // 获取前一页的最后一个数据的下标
+    int from = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
+    // 根据当前页数乘默认每页条数获取当前页的最后一条数据下标
+    int end = current * SystemConstants.DEFAULT_PAGE_SIZE;
+    // 3. 查询redis、按照距离排序、分页。结果：shopId、distance
+    String key = RedisConstants.SHOP_GEO_KEY + typeId;
+    // GEOSEARCH key BYLONLAT x y BYRADIUS 10 WITHDISTANCE
+    GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo()
+            .search(
+                    key,
+                    // 传入经纬度
+                    GeoReference.fromCoordinate(x, y),
+                    // 设置距离
+                    new Distance(5000),
+                    RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs()
+                            .includeDistance() // 返回距离信息
+                            .limit(end) // 最多返回 end 条信息
+            );
+    // 4. 解析出 GEO id
+    if (results == null) {
+        return Result.ok(Collections.emptyList());
+    }
+    List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
+    if (list.size() <= from) {
+        // 如果获取的数据比上一页的最后一条数据的下标还小，证明没有下一页了，结束
+        return Result.ok(Collections.emptyList());
+    }
+    // 处理分页数据，截取 from ~ end的部分
+    List<Long> ids = new ArrayList<>(list.size());
+    Map<String, Distance> distanceMap = new HashMap<>(list.size());
+    list.stream().skip(from) // 跳过前 from 条，拿到当前页数据
+            .forEach(result -> { // 遍历分页中的数据
+        // 获取 GEO 的 member，这里存的是店铺 ID
+        String shopIdStr = result.getContent().getName();
+        ids.add(Long.valueOf(shopIdStr));
+        // 临时存储店铺距离，后续填充到返回数据
+        Distance distance = result.getDistance();
+        distanceMap.put(shopIdStr, distance);
+    });
+    // 5. 根据 id 查询数据库的 Shop 详细信息
+    String idStr = StrUtil.join(",", ids);
+    // 与上面内容一样，需要手动拼接 order by 设置查询顺序，保持与 GEO 的存储顺序一致
+    List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
+    for (Shop shop : shops) {
+        shop.setDistance(distanceMap.get(shop.getId().toString()).getValue());
+    }
+    return Result.ok(shops);
+}
+```
+
+****    
 
 
 

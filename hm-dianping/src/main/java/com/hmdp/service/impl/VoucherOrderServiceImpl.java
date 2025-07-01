@@ -10,6 +10,7 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.UserHolder;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
@@ -61,12 +62,18 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
     }
 
+    @PreDestroy
+    public void stop() {
+        log.info("准备关闭秒杀处理线程...");
+        SECKILL_ORDER_EXECUTOR.shutdownNow();
+    }
+
     private class VoucherOrderHandler implements Runnable {
         String queueName = "stream.orders";
 
         @Override
         public void run() {
-            while (true) {
+            while (!Thread.currentThread().isInterrupted()) {
                 try {
                     // 1. 获取消息队列中的订单信息：XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS streams.order >
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
@@ -95,7 +102,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
 
         private void handlePendingList() {
-            while (true) {
+            while (!Thread.currentThread().isInterrupted()) {
                 try {
                     // 1. 获取 pending-list 中的订单信息：XREADGROUP GROUP g1 c1 COUNT 1 STREAMS streams.order 0
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
