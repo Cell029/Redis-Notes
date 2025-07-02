@@ -15,10 +15,7 @@ import org.springframework.data.geo.Point;
 import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.TreeMap;
+import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -144,6 +141,23 @@ class HmDianPingApplicationTests {
             }
             stringRedisTemplate.opsForGeo().add(key, locations);
         }
+    }
+
+    @Test
+    void testHyperLoglog() {
+        String[] users = new String[1000];
+        int index = 0;
+        for (int i = 0; i < 1000000; i++) {
+            users[index++] = "user_" + i;
+            // 每一千条发送一次
+            if (i % 1000 == 0) {
+                index = 0;
+                stringRedisTemplate.opsForHyperLogLog().add("hll:", Arrays.toString(users));
+            }
+        }
+        // 统计数量
+        Long hllSize = stringRedisTemplate.opsForHyperLogLog().size("hll:");
+        System.out.println("hllSize = " + hllSize); // 990
     }
 
 }

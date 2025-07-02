@@ -3279,7 +3279,234 @@ public Result queryShopByType(Integer typeId, Integer current, Double x, Double 
 }
 ```
 
-****    
+**** 
+### 11. 用户签到
+
+#### 11.1 BitMap
+
+针对签到功能，其实可以依靠数据库来完成，用户每签到一次就向签到表中插入一条数据，但是这种方式太浪费存储空间了，如果使用的人数一多，就会导致数据库中的数据超多，查询统计困难，效率低下。
+所以引出了一种新的机制，模拟现实中的签到卡片，一张卡片上记录一个月的签到情况，签到了就在对应的那天打上勾就行，而 Redis 中的 BitMap 就能实现类似的功能，把每月的每一天用一个 bit 标示，
+用 0 和 1 标记签到情况，所以一个月最多使用 31 位 bit，redis 中是利用 String 类型结构实现 BitMap 的，本质为一串二进制序列，
+所以最大上限为 512 M（Redis 单个 String 最大 512 MB），对应 2^32 个 bit 位。
+
+常用命令：
+
+* SETBIT：向指定位置（offset）存入一个 0 或 1，key 不存在时则自动创建
+
+```redis
+SETBIT key offset value
+
+SETBIT sign:1001:2025-07 0 1   # 设置第0位为1，表示7月1号已签到
+SETBIT sign:1001:2025-07 1 1   # 设置第1位为1，表示7月2号已签到
+``` 
+
+* GETBIT ：获取指定位置（offset）的 bit 值，返回 1 表示该位置 bit 为 1；返回 0 表示该位置 bit 为 0（不存在的 key 默认返回 0）
+
+```redis
+GETBIT key offset
+
+GETBIT sign:1001:2025-07 0   # 返回 1
+GETBIT sign:1001:2025-07 5   # 返回 0
+```
+
+* BITCOUNT ：统计 BitMap 中值为 1 的 bit 位的数量，start、end：表示字节范围，单位是字节（byte），不是 bit 位
+
+```redis
+BITCOUNT key [start] [end]
+
+BITCOUNT sign:1001:2025-07  # 统计整个月的签到天数
+# 范围统计，统计前 1 个字节（即前 8 天）的签到
+BITCOUNT sign:1001:2025-07 0 0
+```
+
+* BITFIELD ：操作（查询、修改、自增）BitMap 中 bit 数组中的指定位置（offset）的值（把一段连续的 bit 位组合成一个整数）
+
+常见子命令：GET（获取指定位置的整数）、SET（设置指定位置的整数）、INCRBY（指定位置整数自增指定值）
+数据类型格式：u{bits} 表示无符号整数（如 u8 表示8位）；i{bits} 表示有符号整数
+
+```redis
+BITFIELD key [subcommand] [arguments]...
+
+# 设置第0位开始的8位无符号整数值为100
+BITFIELD mybitmap SET u8 0 100
+# 获取第0位开始的8位无符号整数
+BITFIELD mybitmap GET u8 0
+# 指定位置自增 1
+BITFIELD mybitmap INCRBY u8 0 1
+```
+
+* BITFIELD_RO ：获取 BitMap 中 bit 数组，并以十进制形式返回，与 BITFIELD 类似，但不能修改数据
+
+```redis
+BITFIELD_RO mybitmap GET u8 0  # 获取第0位起8位的值
+```
+
+* BITOP ：将多个 BitMap 的结果做位运算（与 AND 、或 OR、异或 XOR）
+
+```redis
+BITOP operation destkey key [key...]
+
+# 统计7月1日，用户A、B是否都签到（AND）
+BITOP AND both:2025-07-01 sign:1001:2025-07 sign:1002:2025-07
+
+# 统计7月1日，至少有一人签到（OR）
+BITOP OR one:2025-07-01 sign:1001:2025-07 sign:1002:2025-07
+```
+
+* BITPOS ：查找 bit 数组中指定范围内第一个 0 或 1 出现的位置
+
+```redis
+BITPOS key bit [start] [end]
+
+# 查找第一个未签到（0）的位置
+BITPOS sign:1001:2025-07 0
+
+# 查找第一个已签到（1）的位置
+BITPOS sign:1001:2025-07 1
+```
+
+****
+#### 11.2 实现签到
+
+可以把年和月（通过代码获取当前时间）作为 bitMap 的 key 然后保存到一个 bitMap 中，每次签到就到对应的位上把数字从 0 变成 1，只要对应是 1，就表明说明这一天已经签到了，反之则没有签到。
+
+```java
+public Result sign() {
+    // 1. 获取当前登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2. 获取日期
+    LocalDateTime now = LocalDateTime.now();
+    // 3. 给 key 的后缀拼接上现在的年月
+    String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+    String key = RedisConstants.USER_SIGN_KEY + userId + keySuffix;
+    // 4. 获取今天是本月的第几天
+    int dayOfMonth = now.getDayOfMonth();
+    // 5. 写入 Redis: SETBIT key offset 1，true 代表 1
+    stringRedisTemplate.opsForValue().setBit(key, dayOfMonth - 1, true);
+    return Result.ok();
+}
+```
+
+****
+#### 11.3 统计当前连续签到天数
+
+从最后一次签到开始向前统计，直到遇到第一次未签到为止，计算总的签到次数，就是当前连续签到的天数。因为获取的内容是 0 1 组合的 bit 位，所以可以通过由后向前的方式，
+对每个 bit 位进行与 1 的与运算，只有遇到 1 才返回 1，就可以让计数器 +1，遇到 0 就结束，统计当前计数器。
+
+```java
+public Result signCount() {
+    ...
+    // 5. 获取本月截止今天为止的所有的签到记录，返回的是一个十进制的数字 BITFIELD sign:userId:202507 GET u2 0
+    List<Long> result = stringRedisTemplate.opsForValue().bitField(
+            key,
+            BitFieldSubCommands.create()
+                    .get(BitFieldSubCommands.BitFieldType.unsigned(dayOfMonth)).valueAt(0)
+    );
+    if (result == null || result.isEmpty()) {
+        // 没有任何签到结果
+        return Result.ok(0);
+    }
+    // 因为只返回了一条数据，所以获取第一个即可
+    Long num = result.getFirst();
+    if (num == null || num == 0) {
+        return Result.ok(0);
+    }
+    // 6.循环遍历
+    int count = 0;
+    while (true) {
+        // 让这个数字与 1 做与运算，得到数字的最后一个bit位
+        // 判断这个bit位是否为0
+        if ((num & 1) == 0) {
+            // 如果为0，说明未签到，直接结束
+            break;
+        }else {
+            // 如果不为0，说明已签到，计数器+1
+            count++;
+        }
+        // 把数字右移一位，抛弃最后一个 bit 位，继续下一个 bit 位
+        num >>>= 1;
+    }
+    return Result.ok(count);
+}
+```
+
+****
+### 12. UV 统计
+
+#### 12.1 HyperLogLog
+
+* UV：全称 Unique Visitor，也叫独立访客量，是指通过互联网访问、浏览这个网页的自然人，当 1 天内同一个用户多次访问该网站，只记录 1 次。
+* PV：全称 Page View，也叫页面访问量或点击量，用户每访问网站的一个页面就记录 1 次 PV，用户多次打开页面，则记录多次 PV，通常用来衡量网站的流量。
+
+传统的 UV 统计在服务端做会比较麻烦，因为要判断该用户是否已经统计过了，需要将统计过的用户信息保存（如用户ID、IP、Cookie）。
+但是如果每个访问的用户都保存到 Redis 中，数据量会非常恐怖，为了解决这种难题，HyperLogLog 由此而生。
+
+Hyperloglog(HLL) 是从 Loglog 算法派生的概率算法，用于确定非常大的集合的基数，而不需要存储其所有值，是一种概率性数据结构。
+Redis 中的 HLL 是基于 string 结构实现的，单个 HLL 的内存永远小于16 kb，内存占用极低，但作为代价，其测量结果是概率性的，有小于0.81％的误差。
+不过对于 UV 统计来说完全可以忽略。
+
+常用命令：
+
+- 添加元素，新增元素到 HyperLogLog，重复元素不会影响结果（天生适合做统计次数）
+
+```redis
+PFADD key element [element ...]
+
+PFADD uv_2025-07-02 user1
+PFADD uv_2025-07-02 user2
+PFADD uv_2025-07-02 user3
+PFADD uv_2025-07-02 user1  # 重复添加，无影响
+```
+
+- 统计基数（UV 数量）
+
+```redis
+PFCOUNT key [key ...]
+
+# 返回 3，表示有 3 个不同用户
+PFCOUNT uv_2025-07-02
+```
+
+- 合并多个 HyperLogLog，统计总的不同元素数，常用于跨天、跨设备、跨系统 UV 汇总
+
+```redis
+PFMERGE destkey sourcekey [sourcekey ...]
+
+PFMERGE uv_total uv_2025-07-01 uv_2025-07-02 uv_2025-07-03
+PFCOUNT uv_total
+```
+
+测试：
+
+使用前：used_memory:1304896 字节，使用后：1329600 字节，最终返回的数据虽然不是 1000，但是只占用了 24 kb，内存占用较小。
+
+```java
+@Test
+void testHyperLoglog() {
+    String[] users = new String[1000];
+    int index = 0;
+    for (int i = 0; i < 1000000; i++) {
+        users[index++] = "user_" + i;
+        // 每一千条发送一次
+        if (i % 1000 == 0) {
+            index = 0;
+            stringRedisTemplate.opsForHyperLogLog().add("hll:", Arrays.toString(users));
+        }
+    }
+    // 统计数量
+    Long hllSize = stringRedisTemplate.opsForHyperLogLog().size("hll:");
+    System.out.println("hllSize = " + hllSize); // 990
+}
+```
+
+****
+
+
+
+
+
+
+
 
 
 
