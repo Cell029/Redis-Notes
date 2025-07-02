@@ -3500,13 +3500,584 @@ void testHyperLoglog() {
 ```
 
 ****
+## 3. 分布式缓存
+
+单机的 Redis 存在四大问题：
+
+1、容量瓶颈
+
+Redis 是内存级数据库，数据全部存放在内存中，单机内存受限，数据量增长到一定规模就无法单机承载，这就容易出现内存溢出，造成数据丢失。
+
+2、并发瓶颈
+
+Redis 单线程处理命令（核心线程单独负责网络读写和命令执行），尽管单线程高效，但高并发下，命令队列容易堆积，这就会导致响应时间变长，出现性能瓶颈。
+
+3、单点故障风险
+
+单机 Redis 一旦宕机，缓存数据就会全部丢失（如果未持久化），依赖于 Redis 的系统功能也将无法使用。
+
+4、数据持久化风险
+
+单机 Redis 支持 RDB、AOF 两种持久化，但 RDB 持久化存在快照间隔，数据可能丢失；AOF 追加日志若未设置 always 策略，也可能丢数据
+
+### 1. Redis 持久化
+
+#### 1.1 RDB 持久化
+
+RDB 全称 Redis Database Backup file（Redis数据备份文件），也被叫做 Redis 数据快照，简单来说就是将某一时刻 Redis 内存中的所有数据，生成二进制文件（.rdb 文件）保存在磁盘。
+当 Redis 宕机重启后，可以从磁盘读取快照文件并恢复数据。快照文件称为 RDB 文件，默认是保存在当前运行目录。
+
+RDB持久化在以下情况会执行：
+
+- 执行 save 命令，Redis 立即开始生成 dump.rdb 文件
+
+会同步阻塞式生成 RDB 快照，并且由 Redis 主线程直接执行，但期间无法响应任何请求。
+
+- 执行 bgsave 命令
+
+异步后台生成 RDB 快照，Redis 会使用 fork() 创建子进程，父进程继续正常处理请求，而子进程负责内存数据复制，生成 RDB 文件。
+
+- Redis 停机时
+
+使用 SHUTDOWN SAVE 命令或直接关闭 Redis 服务时，如果 Redis 开启了持久化（RDB 或 AOF），在停机前就会生成 RDB 快照。
+
+```redis
+SHUTDOWN SAVE   # 停机前强制保存 RDB
+SHUTDOWN NOSAVE # 停机不保存数据
+```
+
+- 触发 RDB 条件时
+
+Redis 内部会自动检测，达到指定时间+写操作次数条件时会自动执行 BGSAVE 命令，也可以通过 CONFIG SET save "" 关闭自动 RDB
+
+例如：
+
+```redis
+save 900 1      # 900秒内至少1次写操作，触发RDB
+save 300 10     # 300秒内至少10次写操作，触发RDB
+save 60 10000   # 60秒内至少10000次写操作，触发RDB
+```
+
+```redis
+# 是否压缩 ,建议不开启，压缩也会消耗cpu，磁盘的话不值钱
+rdbcompression yes
+
+# RDB文件名称
+dbfilename dump.rdb  
+
+# 文件保存的路径目录
+dir ./ 
+```
+
+****
+#### 1.2 RDB 的 BGSAVE 执行原理
+
+BGSAVE 命令执行过程：
+
+1. 父进程创建子进程：
+
+当客户端发送 BGSAVE 命令给 Redis 服务器时，Redis 的父进程会调用操作系统的 fork 函数创建一个子进程，然后操作系统会为子进程分配一套新的页表（虚拟内存映射表），
+父子进程的页表指向同一块物理内存，此时物理内存没有立即整体复制，只有在父进程有写操作时，才触发 Copy-On-Write，针对被修改的内存页单独复制
+
+2. 子进程进行数据快照：
+
+子进程会先拷贝父进程的内存页表（COW共享），然后负责将内存中的数据写入磁盘，生成 RDB 文件。在这个过程中，子进程会按照 Redis 的 RDB 文件格式，
+依次将 Redis 数据库中的键值对、过期时间等信息序列化后写入文件。而父进程在子进程执行数据写入操作期间，仍然可以继续处理客户端的请求，
+不过它不会对共享内存数据进行修改（除了一些特殊情况，如过期键的删除等），因为系统会触发 COW 为修改的内存页创建物理副本，让父线程对副本进行修改，
+子进程不受影响，仍基于 fork 时刻的内存视图生成 RDB，当再次调用 BGSAVE 时才会把刚刚修改的副本作为新的内存页写入 RDB。
+
+3. 完成持久化并清理：
+
+当子进程成功将所有数据写入磁盘，生成完整的 RDB 文件后，会向父进程发送一个信号（通常是 SIGCHLD 信号），告知父进程持久化操作已经完成。
+父进程收到信号后，会进行一些必要的清理工作，比如更新相关的持久化状态信息等。
+
+BGSAVE 与 Copy-On-Write 的优缺点：
+
+优点：
+
+- 快速恢复：RDB 文件是数据的快照，在 Redis 重启时，通过加载 RDB 文件可以快速恢复数据（RDB 文件结构是二进制压缩格式，加载效率极高），相比其他持久化方式（如 AOF），恢复速度更快。
+- 节省内存和 IO 开销：Copy-On-Write 技术减少了数据复制的内存占用，并且在子进程进行持久化期间，父进程可以继续处理请求，提高了系统的并发处理能力，同时也降低了磁盘 IO 的压力。
+缺点：
+
+- 数据丢失风险：如果两次 RDB 持久化之间的数据变化没有其他持久化方式补充，那么在 Redis 意外宕机时数据会丢失。例如，在执行BGSAVE后，10 分钟内发生宕机，这 10 分钟的数据修改就会丢失。
+- 对系统性能有一定影响：执行 BGSAVE 时，fork 子进程会消耗一定的系统资源，在内存数据量非常大时，fork 操作可能会导致短时间内系统性能下降。同时，写时复制过程中，如果频繁有写操作（多次使用 COW），也会增加内存管理和数据复制的开销。
+
+****
+#### 1.3 AOF 持久化
+
+AOF（Append Only File）是通过日志追加的方式，将 Redis 每次执行的写命令记录到磁盘文件中（.aof 文件），当 Redis 宕机重启时，会按照 AOF 文件中记录的命令顺序重新执行一遍，从而将数据恢复到最新状态。
+Redis 接收到客户端的写命令（如 SET、DEL、HSET 等）后，会先将该命令追加到 AOF 文件的末尾，文件追加结束后，根据配置决定是否立即更新到磁盘，该操作由主进程完成。
+
+例如：
+
+```redis
+SET name "Redis"
+HSET user age 18
+
+*3
+$3
+SET
+$4
+name
+$5
+Redis
+*4
+$4
+HSET
+$4
+user
+$3
+age
+$2
+18
+```
+
+- always：每个写命令执行完，立马将 AOF 缓冲区中的内容写入并同步到 AOF 文件。这种策略数据安全性最高，因为一旦发生宕机，最多只会丢失一个命令的数据，但频繁的磁盘 IO 操作会对 Redis 的性能产生较大影响。
+- everysec（默认）：每秒将 AOF 缓冲区中的内容写入并同步到 AOF 文件。这种策略在数据安全性和性能之间做了一个平衡，即使发生宕机也最多只丢失 1 秒内的数据，但由于每秒只进行一次磁盘同步操作，对性能的影响相对较小。
+- no：由操作系统决定何时将 AOF 缓冲区中的内容写入和同步到磁盘。这种策略的性能最好，因为减少了主动的磁盘同步操作，但数据安全性最低，一旦系统崩溃，可能会造成数据丢失。
+
+```redis
+# 是否开启AOF功能，默认是no
+appendonly yes
+# AOF文件的名称
+appendfilename "appendonly.aof"
+
+# 表示每执行一次写命令，立即记录到AOF文件
+appendfsync always 
+# 写命令执行完先放入AOF缓冲区，然后表示每隔1秒将缓冲区数据写到AOF文件，是默认方案
+appendfsync everysec 
+# 写命令执行完先放入AOF缓冲区，由操作系统决定何时将缓冲区内容写回磁盘
+appendfsync no
+```
 
 
+****
+#### 1.4 AOF 重写（rewrite）机制
+
+随着 Redis 不断执行写命令，AOF 文件会越来越大，这不仅会占用大量磁盘空间，还会导致 Redis 在重启时恢复数据的时间变长，而 AOF 重写会根据内存中的数据，
+重新生成一份精简的 AOF 文件。它会去除掉 AOF 文件中冗余的命令，比如对同一个键多次执行 SET 命令，那么在重写后的 AOF 文件中只会保留最后一次设置的结果，触发方式如下：
+
+- 手动触发：
+
+可以通过执行 BGREWRITEAOF 命令手动触发 AOF 重写，执行该命令时 Redis 会 fork 出一个子进程，由子进程负责根据内存中的数据生成新的 AOF 文件，
+而父进程继续处理客户端请求。子进程生成完新的 AOF 文件后会通知父进程，父进程将新的 AOF 文件替换旧的 AOF 文件。
+
+- 自动触发：
+
+可以在 Redis 配置文件中设置 auto-aof-rewrite-percentage 和 auto-aof-rewrite-min-size 两个参数来实现自动触发 AOF 重写。
+auto-aof-rewrite-percentage 表示当前 AOF 文件大小相较于上次重写后 AOF 文件大小的增长率，
+auto-aof-rewrite-min-size 表示 AOF 文件的最小大小，当 AOF 文件大小超过设置的大小并且增长率超过 auto-aof-rewrite-percentage 时，就会自动触发 AOF 重写。
+默认情况下，auto-aof-rewrite-percentage 为 100，auto-aof-rewrite-min-size为 64MB。
+
+```redis
+# AOF文件比上次文件 增长超过多少百分比则触发重写
+auto-aof-rewrite-percentage 100
+# AOF文件体积最小多大以上才触发重写 
+auto-aof-rewrite-min-size 64mb 
+```
+
+****
+#### 1.5 RDB 与 AOF对比
+
+1、持久化原理
+
+RDB：
+
+RDB 是对 Redis 某一时刻的内存数据进行快照，将其以二进制文件（.rdb）的形式保存到磁盘。
+
+AOF：
+
+AOF 则是将 Redis 执行的每一个写命令追加到 AOF 文件中，文件以文本形式存储，当 Redis 重启时，通过重新执行 AOF 文件中的命令来恢复数据。
+
+2、数据安全性
+
+RDB：
+
+因为 RDB 是定期或手动生成快照，两次快照之间如果发生宕机，这段时间内的数据修改将会丢失，所以数据的安全性相对较低。
+
+AOF：
+
+如果采用 always 同步策略，那么几乎可以保证不丢失数据；采用 everysec 策略，最多丢失 1 秒内的数据；采用 no 策略，数据丢失量取决于操作系统的写入时机，可能丢失较多数据，但总体上比 RDB 在默认配置下丢失数据的风险要低。
+
+3、对性能的影响
+
+RDB：
+
+执行 BGSAVE 时，fork 子进程会消耗一定的系统资源（主要是内存和 CPU），并且在数据量较大与 COW 触发频繁时，可能会导致 Redis 短时间内响应变慢。
+不过子进程生成 RDB 文件过程中，父进程仍可处理请求，正常情况下对 Redis 的性能影响相对较小。
+
+AOF：
+
+虽然写入 .aof 文件到缓冲区的操作是由主进程执行的，但速度极快几乎不影响，主要还是由处理策略影响：always 策略由于每次写操作都要进行磁盘同步，会严重影响 Redis 的写入性能；everysec 策略每秒同步一次，对性能影响相对较小；no 策略对性能影响最小，但数据安全性也最低。
+不过 AOF 重写时也会 fork 子进程，但一般情况下重写操作不会像 RDB 快照那样频繁进行。
+
+4、文件大小
+
+RDB：
+
+RDB 文件是二进制格式，并且可以开启压缩机制，所以文件体积通常较小。
+
+AOF：
+
+AOF 文件记录的是命令，以文本形式存储，即使经过 AOF 重写去除冗余命令，文件体积通常也会比 RDB 文件大，
+因为 AOF 文件会记录对同一键的多次修改操作，而 RDB 文件在生成快照时只会保留最新的数据状态。
+
+****
+### 2. Redis 主从
+
+#### 2.1 Redis 主从集群的搭建
+
+这里我会在同一台虚拟机中开启3个 redis 实例，模拟主从集群，信息如下：
+
+| IP              | PORT | 角色   |
+|-----------------|------|--------|
+| 172.23.14.3     | 7001 | master |
+| 172.23.14.3     | 7002 | slave  |
+| 172.23.14.3     | 7003 | slave  |
+
+要在同一台虚拟机开启3个实例，必须准备三份不同的配置文件和目录，配置文件所在目录也就是工作目录：
+
+1、创建目录
+
+创建三个文件夹，名字分别叫 7001、7002、7003
+
+```shell
+# 进入/tmp目录
+cd /tmp
+# 创建目录
+mkdir 7001 7002 7003
+```
+
+2、拷贝配置文件到每个实例目录
+
+```shell
+# 因为此时还没给普通用户设置权限，必须通过 sudo 命令临时获取 root 的权限，
+cell@LAPTOP-SVEUFK1D:~$ sudo cp /etc/redis/redis.conf /tmp/7001/
+cell@LAPTOP-SVEUFK1D:~$ sudo cp /etc/redis/redis.conf /tmp/7002/
+cell@LAPTOP-SVEUFK1D:~$ sudo cp /etc/redis/redis.conf /tmp/7003/
+```
+
+```shell
+# 给指定目录赋予 root 权限
+sudo chown -R $USER:$USER /tmp/7001
+sudo chown -R $USER:$USER /tmp/7002
+sudo chown -R $USER:$USER /tmp/7003
+```
+
+3、修改每个实例的端口、工作目录
+
+```shell
+sed -i -e 's/port 6379/port 7001/g' -e 's#^dir .*#dir /tmp/7001#g' /tmp/7001/redis.conf
+sed -i -e 's/port 6379/port 7002/g' -e 's#^dir .*#dir /tmp/7002#g' /tmp/7002/redis.conf
+sed -i -e 's/port 6379/port 7003/g' -e 's#^dir .*#dir /tmp/7003#g' /tmp/7003/redis.conf
+```
+
+4、修改每个实例的声明 IP
+
+```shell
+sudo sed -i '1a replica-announce-ip 172.23.14.3' /tmp/7001/redis.conf
+sudo sed -i '1a replica-announce-ip 172.23.14.3' /tmp/7002/redis.conf
+sudo sed -i '1a replica-announce-ip 172.23.14.3' /tmp/7003/redis.conf
+```
+
+5、启动
+
+为了方便查看日志，打开 3 个 ssh 窗口，分别启动 3 个 redis 实例，启动命令：
+
+```shell
+redis-server /tmp/7001/redis.conf
+redis-server /tmp/7002/redis.conf
+redis-server /tmp/7003/redis.conf
+```
+
+6、开启主从关系
+
+现在三个实例还没有任何关系，要配置主从可以使用 replicaof 或者 slaveof（5.0以前）命令。
+
+有临时和永久两种模式：
+
+- 修改配置文件（永久生效）
+    - 在redis.conf中添加一行配置：`slaveof <masterip> <masterport>`
+- 使用 redis-cli 客户端连接到 redis 服务，执行 slaveof 命令（重启后失效）
+
+```shell
+redis-cli -p 7002
+auth 123 # 输入密码，不然使用不了命令
+# 因为 redis 设置了密码，所以连接 master 时需要设置密码，否则主从握手过程中认证失败，master_link_status 会一直是 down，无法同步数据
+CONFIG SET masterauth 123 
+# 设置连接，master 是 7001 端口，slave 是 7002 端口，其余同理
+slaveof 172.23.14.3 7001
+# 查看状态
+info replication
+```
+
+```shell
+127.0.0.1:7001> info replication
+# Replication
+role:master
+connected_slaves:2
+slave0:ip=172.23.14.3,port=7002,state=online,offset=224,lag=3
+slave1:ip=172.23.14.3,port=7003,state=online,offset=224,lag=0
+master_failover_state:no-failover
+master_replid:ed6cddc9b8cfbeb0333b4b3a69a3d4cc23a989d4
+master_replid2:0000000000000000000000000000000000000000
+master_repl_offset:224
+second_repl_offset:-1
+repl_backlog_active:1
+repl_backlog_size:1048576
+repl_backlog_first_byte_offset:1
+repl_backlog_histlen:224
+```
+
+测试：
+
+- 利用redis-cli连接7001，执行`set num 123`
+- 利用redis-cli连接7002，执行`get num`，再执行`set num 666`
+- 利用redis-cli连接7003，执行get num`，再执行`set num 888`
+
+```shell
+127.0.0.1:7003> set num 666
+(error) READONLY You can't write against a read only replica.
+```
+
+可以发现，只有在7001这个master节点上可以执行写操作，7002 和 7003 这两个 slave 节点只能执行读操作。
+
+****
+#### 2.2 主从数据同步原理
+
+##### 1. 全量同步
+
+Redis 主从复制过程中，全量同步是当从节点第一次连接主节点，或断开连接后与主节点复制偏移量差距过大无法进行增量复制时，必须做的一次完整数据同步过程。
+
+同步过程：
+
+1、建立连接与信息交互
+
+从节点开始尝试与主节点建立网络连接，一旦连接成功，从节点就可以向主节点发送同步请求，主节点接收到从节点的数据同步请求后，会检查该从节点是否是第一次与自己进行同步。
+判断依据通常是从节点是否保存有与主节点相关的同步状态信息等。如果判断出这是从节点第一次与主节点进行同步，主节点会向从节点返回自身的数据版本信息，
+比如当前数据的快照版本号等。这一步是为了让从节点记录下主节点当前的数据状态。从节点接收到主节点返回的数据版本信息后，会将其保存下来，用于后续判断数据的一致性和完整性。
+
+2、生成并传输 RDB 文件
+
+主节点确认需要进行全量同步后，会执行 bgsave 命令，fork 出一个子进程来生成 RDB 文件，这个过程中，主节点会对当前内存中的数据进行快照并写入 RDB 文件。
+在主节点执行 bgsave 生成 RDB 文件的过程中，主节点会把这段时间内接收到的所有写命令记录到 repl_baklog（复制积压缓冲区）中。
+这是因为在生成 RDB 文件期间，主节点的数据可能会发生变化，这些变化需要后续同步到从节点。从节点接收到主节点发送的 RDB 文件后，
+会先清空本地当前存储的数据（如果有的话），然后加载 RDB 文件。
+
+3、同步 RDB 生成期间的写命令
+
+主节点发送 RDB 文件后会把 repl_baklog 中的写命令发送给从节点，这些命令记录了从开始生成 RDB 文件到 RDB 文件生成完成这段时间内主节点数据的变化。
+从节点接收到主节点发送过来的写命令后，会依次执行这些命令，然后从节点可以将自己的数据更新到与主节点当前完全一致的状态，从而完成整个全量同步过程。
+
+主节点通常是通过从节点发送来的 Replication ID（数据集标识） 和 Offset（复制偏移量）识别是否为第一次连接，然后再决定是否需要全量同步：
+
+- **Replication Id**：简称 replid，是数据集的标记，id 一致则说明是同一数据集，每一个主节点都有唯一的 replid，从节点则会继承主节点的 replid
+- **offset**：偏移量，随着记录在 repl_baklog 中的数据增多而逐渐增大，从节点完成同步时也会记录当前同步的 offset，如果从节点的 offset 小于主节点的 offset，说明从节点数据落后于主节点，则需要更新。
+
+因为从节点原本也是一个主节点，有自己的 replid 和 offset，当第一次变成从节点与主节点建立连接时，发送的 replid 和 offset 是自己的，
+主节点判断发现从节点发送来的 replid 与自己的不一致，说明这是一个全新的从节点，就知道要做全量同步了，
+然后主节点会将自己的 replid 和 offset 都发送给这个从节点，从节点则会保存这些信息，以后从节点的 replid 就与主节点一致了。
 
 
+****
+##### 2. 增量同步
 
+全量同步需要先做 RDB，然后将 RDB 文件通过网络传输给从节点，但这样的成本太高了，因此除了第一次做全量同步，其它大多数时候主从节点之间都是做增量同步。
+增量同步是指主从复制过程中，只同步主节点与从节点之间数据差异的部分，通常用于短时间内网络波动、从节点短暂掉线、或正常复制延续场景。
 
+增量同步的前提必须依赖复制偏移量（offset）和复制积压缓冲区（backlog）：
 
+- 复制偏移量
+
+主节点和每个从节点都有自己的偏移量（replication offset）来表示同步的数据字节位置，正常情况下主从偏移量保持一致。
+
+- 复制积压缓冲区
+
+主节点分配一块内存区域（repl_backlog_size，默认1MB），它是环形结构，保存最近写命令的数据。
+
+流程：
+
+1、正常主从复制
+
+主节点执行写命令，然后发送给从节点同时写入积压缓冲区，从节点接收并应用写命令，更新本地数据
+
+2、从节点短暂掉线
+
+从节点由于网络波动或宕机，连接中断，但主节点仍保持积压缓冲区，所以从节点断开期间的写操作都保存在缓冲区
+
+3、从节点重连主节点
+
+从节点重新连接后会发送 replid 和 offset，主节点会判断是否满足增量同步条件，即判断 replid 是否一致并且偏移量差距在积压缓冲区范围内
+
+4、主节点发送缺失数据
+
+主节点从缓冲区中找到从节点缺失的部分数据并发送（若从节点长时间掉线，会导致挤压缓冲区的数据堆积导致大小不足，数据被覆盖），从节点接收到数据后进行更新，并将偏移量与主节点同步
+
+积压缓冲区原理：
+
+repl_backlog 是 Redis 实现增量同步的关键组件，本质是一个固定大小的环形字节数组，也就是说当角标到达数组末尾后，会再次从 0 开始读写，这样数组头部的数据就会被覆盖了。
+repl_baklog 中会记录 Redis 处理过的命令日志及 offset，包括主节点当前的 offset，和从节点的 offset（从节点定期发送 offset），而主从之间的 offset 的差异就是从节点需要增量拷贝的数据。
+如果主节点持续写入数据，那么 offset 就会不断增长，最终导致环形缓冲区开始覆盖旧数据，若从节点的 offset 已被覆盖，主节点就无法提供增量数据，此时触发全量同步。
+
+主从同步优化：
+
+Redis 主从复制默认情况下虽然简单，但高并发、大数据量下存在全量同步代价高、大量从节点直接挂靠主节点，主节点压力大等问题，可以通过以下方法进行优化：
+
+- 在 master 中配置 repl-diskless-sync yes 启用无磁盘复制，避免全量同步时的磁盘 IO
+- Redis 单节点上的内存占用不要太大，减少 RDB 导致的过多磁盘 IO
+- 适当提高 repl_baklog 的大小，发现从节点宕机时尽快修复故障，尽可能避免全量同步
+- 限制一个主节点上的从节点数量，如果实在是太多从节点，则可以采用主-从-从链式结构（Master → Slave1 → Slave2 → Slave3），减少主节点压力
+
+****
+### 3. Redis 哨兵
+
+#### 3.1 哨兵原理
+
+Redis 主从架构虽然能实现读写分离和数据冗余，但无法自动故障切换，当主节点宕机时会导致数据无法恢复，需要人为进行操作，恢复数据，而哨兵模式为此提供了解决方案，
+当主节点故障时会被哨兵监控到，然后让其中一个从节点成为新的主节点，保证整个系统的数据不会丢失。
+
+主要功能：
+
+- **监控**：Sentinel 会不断检查主从节点是否按预期工作
+- **自动故障恢复**：如果主节点故障，Sentinel 会将一个从节点提升为主节点，当故障实例恢复后也以新的主节点为主
+- **通知**：Sentinel 充当 Redis 客户端的服务发现来源，当集群发生故障转移时，会将最新信息推送给 Redis 的客户端
+
+集群监控原理：
+
+哨兵监控 Redis 集群的实时健康状态以及时发现主节点和从节点的网络、服务是否异常；判断故障是否真实，防止误判；一旦确认故障，执行主从切换。
+
+1、心跳机制
+
+Sentinel 每隔 1 秒就会向所有主节点和从节点对象发送 PING 命令，如果它们没有在规定时间内响应 PING 返回 PONG，该 Sentinel 就会主观的认为它们发生故障下线。
+
+2、客观下线
+
+因为整个系统的监听不可能只使用一个哨兵，系统会配置多个 Sentinel 一起监听，当多个 Sentinel（一般是一半）都判断某个或某几个主从节点下线时，则标记为客观下线，执行切换操作。
+
+一旦发现主节点故障，Sentinel 需要在从节点中选择一个作为新的主节点，选择依据是这样的：
+
+- 首先会判断从节点与主节点断开时间的长短，如果超过指定值（down-after-milliseconds * 10）则会排除该从节点，一次避免使用较为老旧的节点
+- 然后判断从节点的 slave-priority 值，越小则优先级越高，如果是 0 则永不参与选举（即备胎节点）
+- 如果 slave-prority 一样，则判断从节点的 offset 值（offset 反映主从节点的数据同步进度），越大说明数据越新，则优先级越高
+- 若上述条件均相同（极少出现），则是判断从节点的运行 id 大小，越小优先级越高。
+
+主从节点的切换：
+
+- sentinel 给备选的 slave1 节点发送 slaveof no one 命令，让该节点成为 master
+- sentinel 给所有其它 slave 发送 slaveof ip slave1 命令，让这些 slave 成为新 master 的从节点，开始从新的 master 上同步数据。
+- 最后，sentinel 将故障节点标记为 slave，当故障节点恢复后会自动成为新的 master 的 slave 节点
+
+****
+#### 3.2 搭建哨兵集群
+
+三个 sentinel 实例信息如下：
+
+| 节点 | IP   | PORT  |
+|----|------|-------|
+| s1 | 172.23.14.3 | 27001 |
+| s2 | 172.23.14.3 | 27002 |
+| s3 | 172.23.14.3 | 27003 |
+
+要在同一台虚拟机开启 3 个实例，必须准备三份不同的配置文件和目录，配置文件所在目录也就是工作目录，创建三个文件夹，名字分别叫s1、s2、s3：
+
+```shell
+# 进入/tmp目录
+cd /tmp
+# 创建目录
+mkdir s1 s2 s3
+```
+
+然后在 s1 目录创建一个 sentinel.conf 文件：
+
+```shell
+vi s1/sentinel.conf
+```
+
+添加下面的内容：
+
+```shell
+port 27001
+sentinel announce-ip 172.23.14.3
+sentinel monitor mymaster 172.23.14.3 7001 2
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 60000
+sentinel auth-pass mymaster 123
+dir "/tmp/s1"
+```
+
+- `port 27001`：是当前 sentinel 实例的端口
+- `sentinel monitor mymaster 172.23.14.3 7001 2`：指定主节点信息
+    - `mymaster`：主节点名称，自定义，任意写
+    - `172.23.14.3 7001`：主节点的 ip 和端口
+    - `2`：选举 master 时的 quorum 值
+
+然后将 s1/sentinel.conf 文件拷贝到 s2、s3 两个目录中（在/tmp目录执行下列命令）：
+
+```shell
+cp s1/sentinel.conf s2
+cp s1/sentinel.conf s3
+```
+
+修改 s2、s3 两个文件夹内的配置文件，将端口分别修改为 27002、27003：
+
+```shell
+sed -i -e 's/27001/27002/g' -e 's/s1/s2/g' s2/sentinel.conf
+sed -i -e 's/27001/27003/g' -e 's/s1/s3/g' s3/sentinel.conf
+```
+
+启动命令：
+
+```shell
+ redis-server /tmp/s1/sentinel.conf --sentinel
+ redis-server /tmp/s2/sentinel.conf --sentinel
+ redis-server /tmp/s3/sentinel.conf --sentinel
+```
+
+测试：
+
+开启 7001、7002、7003 端口，并设置好主从关系，7001 为 master，7002 和 7003 为 slave，开启 s1、s2、s3 哨兵，开始监听节点，
+当我关闭 7001 master 节点时，哨兵会开始发现 master 故障:
+
+```shell
++failover-state-select-slave master mymaster 172.23.14.3 7001
+```
+
+然后判断是否为客观下线：
+
+```shell
+# 这里成功判断为客观下线
++odown master mymaster 172.23.14.3 7001 #quorum 2/2
+```
+
+然后根据判断选取另一个从节点作为新的主节点：
+
+```shell
++switch-master mymaster 172.23.14.3 7001 172.23.14.3 7003
+```
+
+然后哨兵通知其他节点以后从 7002 那里复制数据：
+
+```shell
++slave slave 172.23.14.3:7002 172.23.14.3 7002 @ mymaster 172.23.14.3 7003
+```
+
+验证一下：
+
+```shell
+cell@LAPTOP-SVEUFK1D:~$ redis-cli -a 123 -p 7003 info replication
+# Replication
+role:master # 成为主节点
+connected_slaves:1 # 有一个新的从节点
+```
+
+```shell
+cell@LAPTOP-SVEUFK1D:~$ redis-cli -p 27001 info sentinel
+# Sentinel
+sentinel_masters:1 # 监听一个主节点
+master0:name=mymaster,status=ok,address=172.23.14.3:7003,slaves=2,sentinels=3 # 这个主节点是 7003 端口
+```
+
+****
 
 
 
