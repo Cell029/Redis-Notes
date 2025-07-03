@@ -4078,6 +4078,992 @@ master0:name=mymaster,status=ok,address=172.23.14.3:7003,slaves=2,sentinels=3 # 
 ```
 
 ****
+#### 3.2 Redis Template
+
+在 Sentinel 集群监管下的 Redis 主从集群，其节点会因为自动故障转移而发生变化，Redis 的客户端必须感知这种变化，及时更新连接信息。
+Spring 的 RedisTemplate 底层利用 lettuce 实现了节点的感知和自动切换。
+
+引入 redis 相关依赖：
+
+```pom
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
+
+配置 redis 的 sentinel 相关信息
+
+```yaml
+spring:
+  data:
+    redis:
+      password: 123
+      sentinel:
+        master: mymaster
+        nodes:
+          - 172.23.14.3:27001
+          - 172.23.14.3:27002
+          - 172.23.14.3:27003
+        password: 123
+```
+
+在项目的启动类中，添加一个新的 bean：
+
+```java
+@Bean
+public LettuceClientConfigurationBuilderCustomizer clientConfigurationBuilderCustomizer(){
+    return clientConfigurationBuilder -> clientConfigurationBuilder.readFrom(ReadFrom.REPLICA_PREFERRED);
+}
+```
+
+这个bean中配置的就是读写策略，包括四种：
+
+- MASTER：从主节点读取
+- MASTER_PREFERRED：优先从 master 节点读取，master 不可用才读取 replica
+- REPLICA：从 slave（replica）节点读取
+- REPLICA _PREFERRED：优先从 slave（replica）节点读取，所有的 slave 都不可用才读取 zmaster
+
+启动时可以看到连接到了 redis 集群，里面又三个节点，
+
+```text
+Trying to get a Redis Sentinel connection for one of: [redis://***@172.23.14.3:27001, redis://***@172.23.14.3:27002, redis://***@172.23.14.3:27003]
+```
+
+检测到 7001 下线后就会更新节点：
+
+```text
+[channel=0xbf690b21, /172.23.0.1:55372 -> /172.23.14.3:27001, epid=0x15, chid=0x1d] channelInactive()
+```
+
+```text
+RedisMasterReplicaNode [redisURI=redis://***@172.23.14.3:7003, role=REPLICA], 
+RedisMasterReplicaNode [redisURI=redis://***@172.23.14.3:7002, role=UPSTREAM], 
+RedisMasterReplicaNode [redisURI=redis://***@172.23.14.3:7001, role=REPLICA]
+```
+
+当 7001 重启后会收到来自 Sentinel 的变更通知：
+
+```text
+Received topology changed signal from Redis Sentinel (+role-change)
+```
+
+****
+### 4. Redis 分片集群
+
+#### 4.1 搭建分片集群
+
+主从和哨兵可以解决高可用、高并发读的问题，但是依然有两个问题没有解决：海量数据存储问题以及高并发写的问题，不过使用分片集群可以解决这些问题
+
+分片集群特征：
+
+- 集群中有多个 master，每个 master 保存不同数据
+- 每个 master 都可以有多个 slave 节点
+- master 之间通过 ping 监测彼此健康状态
+- 客户端请求可以访问集群任意节点，最终都会被转发到正确节点
+
+搭建流程：
+
+分片集群需要的节点数量较多，这里我搭建一个最小的分片集群，包含 3 个 master 节点，每个 master 包含一个 slave 节点：
+
+|       IP       | PORT |  角色  |
+|:--------------:| :--: | :----: |
+|  172.23.14.3   | 7001 | master |
+|  172.23.14.3   | 7002 | master |
+|  172.23.14.3   | 7003 | master |
+|  172.23.14.3   | 8001 | slave  |
+|  172.23.14.3   | 8002 | slave  |
+|  172.23.14.3   | 8003 | slave  |
+
+
+删除之前的 7001、7002、7003 这几个目录，重新创建出 7001、7002、7003、8001、8002、8003 目录：
+
+```shell
+# 进入/tmp目录
+cd /tmp
+# 删除旧的，避免配置干扰
+rm -rf 7001 7002 7003
+# 创建目录
+mkdir 7001 7002 7003 8001 8002 8003
+```
+
+如果之前开启了 7001、7002、7003 端口，最好提前结束一下，不然可能导致后面无法添加新的 redis.conf 文件：
+
+```shell
+# 查看当前运行进程
+ps -ef | grep redis
+```
+
+```text
+redis        176       1  0 14:14 ?        00:00:10 /usr/bin/redis-server 0.0.0.0:6379
+cell        1321       1 10 14:40 ?        00:03:53 redis-server 0.0.0.0:7001
+cell        1493       1  0 14:46 ?        00:00:05 redis-server 0.0.0.0:7002
+cell        1502       1  0 14:47 ?        00:00:05 redis-server 0.0.0.0:7003
+cell        1574     300  0 15:09 ?        00:00:01 redis-server 0.0.0.0:8001 [cluster]
+cell        1576     300  0 15:09 ?        00:00:01 redis-server 0.0.0.0:8002 [cluster]
+cell        1588     300  0 15:09 ?        00:00:01 redis-server 0.0.0.0:8003 [cluster]
+cell        1629     301  0 15:17 pts/0    00:00:00 grep --color=auto redisv
+```
+
+```shell
+sudo kill -9 1321
+sudo kill -9 1493
+sudo kill -9 1502
+```
+
+在 /tmp 下准备一个新的 redis.conf 文件，内容如下：
+
+```redis
+port 6379
+# 开启集群功能
+cluster-enabled yes
+# 集群的配置文件名称，不需要我们创建，由redis自己维护
+cluster-config-file /tmp/6379/nodes.conf
+# 节点心跳失败的超时时间
+cluster-node-timeout 5000
+# 持久化文件存放目录
+dir /tmp/6379
+# 绑定地址
+bind 0.0.0.0
+# 让redis后台运行
+daemonize yes
+# 注册的实例ip
+replica-announce-ip 172.23.14.3
+# 保护模式
+protected-mode no
+# 数据库数量
+databases 1
+# 日志
+logfile /tmp/6379/run.log
+```
+
+将这个文件拷贝到每个目录下：
+
+```shell
+# 在 /tmp 目录下执行拷贝
+echo 7001 7002 7003 8001 8002 8003 | xargs -t -n 1 cp redis.conf
+```
+
+修改每个目录下的 redis.conf，将其中的 6379 修改为与所在目录一致：
+
+```shell
+# 修改配置文件
+printf '%s\n' 7001 7002 7003 8001 8002 8003 | xargs -I{} -t sed -i 's/6379/{}/g' {}/redis.conf
+```
+
+因为已经配置了后台启动模式，所以可以直接启动服务：
+
+```shell
+# 一键启动所有服务
+printf '%s\n' 7001 7002 7003 8001 8002 8003 | xargs -I{} -t redis-server {}/redis.conf
+```
+
+查看当前登录状态：
+
+```shell
+ps -ef | grep redis
+
+redis        176       1  0 14:14 ?        00:00:11 /usr/bin/redis-server 0.0.0.0:6379
+cell        1574     300  0 15:10 ?        00:00:02 redis-server 0.0.0.0:8001 [cluster]
+cell        1576     300  0 15:10 ?        00:00:02 redis-server 0.0.0.0:8002 [cluster]
+cell        1588     300  0 15:10 ?        00:00:02 redis-server 0.0.0.0:8003 [cluster]
+cell        1668     300  0 15:23 ?        00:00:00 redis-server 0.0.0.0:7001 [cluster]
+cell        1670     300  0 15:23 ?        00:00:00 redis-server 0.0.0.0:7002 [cluster]
+cell        1682     300  0 15:23 ?        00:00:00 redis-server 0.0.0.0:7003 [cluster]
+cell        1689     301  0 15:23 pts/0    00:00:00 grep --color=auto redis
+```
+
+如果要关闭所有进程，可以执行命令：
+
+```shell
+ps -ef | grep redis | awk '{print $2}' | xargs kill
+# 或者（推荐这种方式）：
+printf '%s\n' 7001 7002 7003 8001 8002 8003 | xargs -I{} -t redis-cli -p {} shutdown
+```
+
+虽然服务启动了，但是目前每个服务之间都是独立的，没有任何关联，需要执行命令来创建集群，在 Redis 5.0 之前创建集群比较麻烦，5.0 之后集群管理命令都集成到了 redis-cli 中：
+
+1）Redis 5.0 之前
+
+Redis 5.0 之前集群命令都是用 redis 安装包下的 src/redis-trib.rb 来实现的。因为 redis-trib.rb 是有 ruby 语言编写的所以需要安装 ruby 环境。
+
+```shell
+# 安装依赖
+yum -y install zlib ruby rubygems
+gem install redis
+```
+
+然后通过命令来管理集群：
+
+```shell
+# 进入redis的src目录
+cd /tmp/redis-6.2.4/src
+# 创建集群
+./redis-trib.rb create --replicas 1 172.23.14.3:7001 172.23.14.3:7002 172.23.14.3:7003 172.23.14.3:8001 172.23.14.3:8002 172.23.14.3:8003
+```
+
+2）Redis 5.0 以后
+
+集群管理以及集成到了 redis-cli 中，格式如下：
+
+```shell
+redis-cli --cluster create --cluster-replicas 1 172.23.14.3:7001 172.23.14.3:7002 172.23.14.3:7003 172.23.14.3:8001 172.23.14.3:8002 172.23.14.3:8003
+```
+
+- `redis-cli --cluster` 或者 `./redis-trib.rb`：代表集群操作命令
+- `create`：代表是创建集群
+- `--replicas 1` 或者 `--cluster-replicas 1` ：指定集群中每个 master 的副本个数为 1，此时 `节点总数 ÷ (replicas + 1)` 得到的就是 master 的数量。因此节点列表中的前 n 个就是 master，其它节点都是 slave 节点，随机分配到不同 master
+
+启动结果：
+
+```shell
+cell@LAPTOP-SVEUFK1D:/tmp$ redis-cli --cluster create --cluster-replicas 1 172.23.14.3:7001 172.23.14.3:7002 172.23.14.3:7003 172.23.14.3:8001 172.23.14.3:8002 172.23.14.3:8003
+>>> Performing hash slots allocation on 6 nodes...
+Master[0] -> Slots 0 - 5460
+Master[1] -> Slots 5461 - 10922
+Master[2] -> Slots 10923 - 16383
+Adding replica 172.23.14.3:8002 to 172.23.14.3:7001
+Adding replica 172.23.14.3:8003 to 172.23.14.3:7002
+Adding replica 172.23.14.3:8001 to 172.23.14.3:7003
+>>> Trying to optimize slaves allocation for anti-affinity
+[WARNING] Some slaves are in the same host as their master
+M: ada56c41f9836d8b0a635c2b915d504e792301c9 172.23.14.3:7001
+   slots:[0-5460] (5461 slots) master
+M: d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7 172.23.14.3:7002
+   slots:[5461-10922] (5462 slots) master
+M: 44714da596fa56671dbd885b7c8d53581705f8ff 172.23.14.3:7003
+   slots:[10923-16383] (5461 slots) master
+S: 3b949b48263380b95b34e0dfff4745b60777c97e 172.23.14.3:8001
+   replicates ada56c41f9836d8b0a635c2b915d504e792301c9
+S: a6a83eb40f681133cbd96e509899dae6b14d1f54 172.23.14.3:8002
+   replicates d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7
+S: d524be6619a813f82c3d5963616174bf9e604da5 172.23.14.3:8003
+   replicates 44714da596fa56671dbd885b7c8d53581705f8ff
+Can I set the above configuration? (type 'yes' to accept): yes
+>>> Nodes configuration updated
+>>> Assign a different config epoch to each node
+>>> Sending CLUSTER MEET messages to join the cluster
+Waiting for the cluster to join
+.
+>>> Performing Cluster Check (using node 172.23.14.3:7001)
+M: ada56c41f9836d8b0a635c2b915d504e792301c9 172.23.14.3:7001
+   slots:[0-5460] (5461 slots) master
+   1 additional replica(s)
+S: d524be6619a813f82c3d5963616174bf9e604da5 172.23.14.3:8003
+   slots: (0 slots) slave
+   replicates 44714da596fa56671dbd885b7c8d53581705f8ff
+S: a6a83eb40f681133cbd96e509899dae6b14d1f54 172.23.14.3:8002
+   slots: (0 slots) slave
+   replicates d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7
+M: d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7 172.23.14.3:7002
+   slots:[5461-10922] (5462 slots) master
+   1 additional replica(s)
+M: 44714da596fa56671dbd885b7c8d53581705f8ff 172.23.14.3:7003
+   slots:[10923-16383] (5461 slots) master
+   1 additional replica(s)
+S: 3b949b48263380b95b34e0dfff4745b60777c97e 172.23.14.3:8001
+   slots: (0 slots) slave
+   replicates ada56c41f9836d8b0a635c2b915d504e792301c9
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+```
+
+查看集群状态：
+
+```shell
+redis-cli -p 7001 cluster nodes
+
+d524be6619a813f82c3d5963616174bf9e604da5 172.23.14.3:8003@18003 slave 44714da596fa56671dbd885b7c8d53581705f8ff 0 1751527506322 3 connected
+ada56c41f9836d8b0a635c2b915d504e792301c9 172.23.14.3:7001@17001 myself,master - 0 0 1 connected 0-5460
+a6a83eb40f681133cbd96e509899dae6b14d1f54 172.23.14.3:8002@18002 slave d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7 0 1751527505920 2 connected
+d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7 172.23.14.3:7002@17002 master - 0 1751527505920 2 connected 5461-10922
+44714da596fa56671dbd885b7c8d53581705f8ff 172.23.14.3:7003@17003 master - 0 1751527505920 3 connected 10923-16383
+3b949b48263380b95b34e0dfff4745b60777c97e 172.23.14.3:8001@18001 slave ada56c41f9836d8b0a635c2b915d504e792301c9 0 1751527505920 1 connected
+```
+
+测试：
+
+```shell
+# 连接
+redis-cli -p 7001
+# 存储数据
+set num 123
+# 读取数据
+get num # 123
+```
+
+再次尝试：
+
+```shell
+# 再次存储
+set a 1
+
+# 报错
+(error) MOVED 15495 172.23.14.3:7003
+```
+
+这个报错是 Redis 集群中的重定向（MOVED）错误，它说明当前执行的 SET a 1 这个 key a 应该存储在槽（slot）编号为 15495 的节点上，但是当前连接的 127.0.0.1:7001 不是该槽对应的主节点。
+因为 Redis 集群会根据 key 的哈希值，把所有 key 映射到 0~16383 这些槽上，不同的槽由不同的主节点负责管理。如果要解决这种情况，就要使用带 -c 参数的 redis-cli 启用集群模式：
+
+```shell
+# 带 -c 后，redis-cli 会自动识别 MOVED 重定向，自动跳转到正确的节点执行命令
+redis-cli -c -h 172.23.14.3 -p 7001
+
+172.23.14.3:7001> set a 1
+-> Redirected to slot [15495] located at 172.23.14.3:7003
+OK
+
+172.23.14.3:7003> get a
+"1"
+```
+
+****
+#### 4.2 散列插槽
+
+Redis Cluster 采用 哈希槽（Hash Slot） 机制来管理数据分布，每个 master 节点负责一部分插槽（共 16384 个），key 通过计算插槽值决定存储在哪个节点上。可以通过 CLUSTER SLOTS 命令查看插槽分布：
+
+```shell
+127.0.0.1:7003> CLUSTER SLOTS
+1) 1) (integer) 0 # 起始插槽
+   2) (integer) 5460 # 结束插槽
+   3) 1) "172.23.14.3"
+      2) (integer) 7001
+      3) "ada56c41f9836d8b0a635c2b915d504e792301c9"
+      4) (empty array)
+   4) 1) "172.23.14.3"
+      2) (integer) 8001 # 从节点端口
+      3) "3b949b48263380b95b34e0dfff4745b60777c97e"
+      4) (empty array)
+2) 1) (integer) 5461
+   2) (integer) 10922
+   3) 1) "172.23.14.3"
+      2) (integer) 7002
+      3) "d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7"
+      4) (empty array)
+   4) 1) "172.23.14.3"
+      2) (integer) 8002
+      3) "a6a83eb40f681133cbd96e509899dae6b14d1f54"
+      4) (empty array)
+3) 1) (integer) 10923
+   2) (integer) 16383
+   3) 1) "172.23.14.3"
+      2) (integer) 7003
+      3) "44714da596fa56671dbd885b7c8d53581705f8ff"
+      4) (empty array)
+   4) 1) "172.23.14.3"
+      2) (integer) 8003
+      3) "d524be6619a813f82c3d5963616174bf9e604da5"
+      4) (empty array)
+```
+
+Redis 使用 CRC16 算法来计算 key 的哈希值，然后对 16384 取模，得到插槽号：
+
+```shell
+slot = CRC16(key) % 16384
+```
+
+而 key 的有效部分分为两种：
+
+- 如果 key 包含 {}，则 {} 内的部分作为有效部分计算插槽。
+
+例如：{user:1000}:name，计算的是 user:1000 的插槽，对应的 value 则一起放在这个插槽中。
+
+- 如果 key 不包含 {}，则整个 key 作为有效部分计算插槽。
+
+例如：user:1000:name，计算的是 user:1000:name 的插槽，对应的 value 则一起放在这个插槽中。
+
+所以客户端访问 key 时也就是先对 key 计算它的插槽，然后判断该插槽是否属于当前节点，如果不属于就重定向到对应的插槽所在节点
+
+****
+#### 4.3 集群伸缩
+
+Redis 集群伸缩是指集群具有扩容与缩容的特点，可以新增与移除节点，因为 Redis 集群采用槽位迁移机制，可以确保数据有序转移，所以支持在线动态调整节点数量（本质是对每个节点槽位的重新分配）。
+例如：向集群中添加一个新的 master 节点，并向其中存储 num = 10
+
+- 启动一个新的 redis 实例，端口为 7004
+- 添加 7004 到之前的集群，并作为一个 master 节点
+- 给 7004 节点分配插槽
+
+配置操作参看上面搭建分片集群的步骤来创建一个新的 redis 实例，创建好后添加该节点到 redis：
+
+```shell
+redis-cli --cluster add-node 172.23.14.3:7004 172.23.14.3:7001
+```
+
+- 172.23.14.3:7004 新节点地址
+- 172.23.14.3:7001 已在集群的任一节点
+
+```shell
+cell@LAPTOP-SVEUFK1D:/tmp$ redis-cli -p 7001 cluster nodes
+...
+# 新增的节点默认是 master
+97c49a23ab32e6f1ca89e9dbbd58c2583e444e04 172.23.14.3:7004@17004 master - 0 1751532051526 8 connected
+
+# node-id：97c49a23ab32e6f1ca89e9dbbd58c2583e444e04，是节点的唯一标识符
+```
+
+可以看到 7004 节点的插槽数量为 0，因此没有任何数据可以存储到 7004 上，所以要进行一次重新分配槽位：
+
+```shell
+# 与集群建立连接
+redis-cli --cluster reshard 172.23.14.3:7001
+# 节点信息
+...
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+How many slots do you want to move (from 1 to 16384)? 
+```
+
+选择需要多少个槽位，然后指定接收这些槽位的节点（用节点 id 指定）：
+
+```shell
+How many slots do you want to move (from 1 to 16384)? 4000
+What is the receiving node ID? 97c49a23ab32e6f1ca89e9dbbd58c2583e444e04
+Please enter all the source node IDs.
+  Type 'all' to use all the nodes as source nodes for the hash slots.
+  Type 'done' once you entered all the source nodes IDs.
+Source node #1: 
+```
+
+这里询问，插槽需要从哪里分配过来：
+
+- all：代表全部，也就是三个节点各转移一部分
+- 具体的节点 id：目标节点的 id，填写谁的就是从谁的那里拿槽位过来
+- done：没有了
+
+
+```shell
+redis-cli -p 7001 cluster nodes
+...
+97c49a23ab32e6f1ca89e9dbbd58c2583e444e04 172.23.14.3:7004@17004 master - 0 1751532051526 8 connected 0-1332 5461-6794 10923-12255
+```
+
+现在后面多了一串数字，这串数字就是该节点负责的槽位（因为是每个槽位都给一部分，所以是这些数字并没有连续）：
+
+- 0-1332（1333 个插槽） 
+- 5461-6794（1334 个插槽） 
+- 10923-12255（1333 个插槽）
+
+如果是移除一个主节点呢，步骤如下：
+
+```shell
+# 登录一个节点，查看当前节点的信息，拿到要删除的节点的 id
+redis-cli -c -h 172.23.14.3 -p 7001
+cluster nodes
+# 97c49a23ab32e6f1ca89e9dbbd58c2583e444e04
+```
+
+因为刚刚给这个节点分配了槽位，所以需要把它的槽位重新分配回去，也就是再执行一遍分配节点的流程， 然后选择要分配槽位的节点，让这个节点接收要移除的节点的所有槽位：
+
+```shell
+redis-cli --cluster reshard 172.23.14.3:7001
+
+How many slots do you want to move (from 1 to 16384)? 4000
+What is the receiving node ID? ada56c41f9836d8b0a635c2b915d504e792301c9 # 用 7001 接收
+Please enter all the source node IDs.
+  Type 'all' to use all the nodes as source nodes for the hash slots.
+  Type 'done' once you entered all the source nodes IDs.
+Source node #1: 97c49a23ab32e6f1ca89e9dbbd58c2583e444e04 # 从 7004 拿
+Source node #2: done
+```
+
+然后移除空的 7004 节点：
+
+```shell
+# 获取连接（从随意一个集群节点获取连接）后删除节点
+redis-cli --cluster del-node 172.23.14.3:7001 97c49a23ab32e6f1ca89e9dbbd58c2583e444e04
+```
+
+如果 7004 有从节点，那么可以选择删除（同 del-node 方法）或者重新分配个其他的主节点：
+
+```shell
+redis-cli -p 8004 CLUSTER REPLICATE <new-master-id>
+```
+
+****
+#### 4.4 故障转移
+
+Redis 集群自动故障转移的前提是每个主节点至少有 1 个从节点，系统会周期性的通过 PING/PONG 探测节点状态。如果我现在手动关闭 7002 端口模拟短路：
+
+```shell
+redis-cli -p 7002 shutdown
+# 监听的信息就会显示 7002 断开连接
+d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7 172.23.14.3:7002@17002 master,fail - 1751534606339 1751534604327 2 disconnected
+# 接着选取从节点作为新的主节点，原本 7002 的槽位由 8002 接管
+a6a83eb40f681133cbd96e509899dae6b14d1f54 172.23.14.3:8002@18002 master - 0 1751534668000 9 connected 6795-10922
+```
+
+当重启 7002 后，7002 则会作为一个主节点的从节点：
+
+```shell
+d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7 172.23.14.3:7002@17002 slave a6a83eb40f681133cbd96e509899dae6b14d1f54 0 1751534
+```
+
+除了系统的自动选取从节点作为新的主节点，也可以通过手动的方式进行故障转移，把某个从节点主动提升为主节点（要求 master 在线配合）
+
+```shell
+cluster failover
+
+d442b5b8de755ff6f97545d4b90d4e08aaa7b1d7 172.23.14.3:7002@17002 master - 0 1751535263579 10 connected 6795-10922
+```
+
+流程：
+
+从节点告诉主节点我要进行转换了，请你停止接收客户端的请求，然后主节点就会开始返回当前的数据给从节点（包含 offset），等从节点的 offset 和主节点的 offset 一致时开始进行故障转移，
+然后标记从节点为新的主节点，然后作为新主节点开始处理客户端请求。
+
+当然，还有别的模式可以跳过一些步骤：
+
+- cluster failover force：省略了对 offset 的一致性校验
+- cluster failover takeover：直接忽略数据一致性、master 状态和其它 master 的意见
+
+****
+#### 4.5 RedisTemplate 访问分片集群
+
+RedisTemplate底层同样基于lettuce实现了分片集群的支持，而使用的步骤与哨兵模式基本一致：
+
+1. 引入 redis 的 starter 依赖
+2. 配置分片集群地址
+3. 配置读写分离
+
+与哨兵模式相比，其中只有分片集群的配置方式略有差异，如下：
+
+```yaml
+spring:
+  data:
+    redis:
+      cluster:
+        nodes:
+          - 172.23.14.3:7001
+          - 172.23.14.3:7002
+          - 172.23.14.3:7003
+          - 172.23.14.3:8001
+          - 172.23.14.3:8002
+          - 172.23.14.3:8003
+```
+
+****
+## 4. 多级缓存
+
+在传统单级缓存（如 Redis）中，可能面临缓存击穿/雪崩、网络延迟、资源浪费（热点数据可能被重复计算或传输）等问题，而多级缓存通过分层存储来解决这些问题，
+优先从速度最快的缓存层获取数据，并逐层回源，减少数据库压力，当某一层失效时仍能从其他层获取数据。
+
+典型的多级缓存架构（三级缓存模型）:
+
+- 浏览器访问静态资源时，优先读取浏览器本地缓存
+- 访问非静态资源（ajax 查询数据）时，访问服务端
+- 请求到达 Nginx 后，优先读取 Nginx 本地缓存
+- 如果 Nginx 本地缓存未命中，则去直接查询 Redis（不经过Tomcat）
+- 如果 Redis 查询未命中，则查询 Tomcat
+- 请求进入 Tomcat 后，优先查询 JVM 进程缓存
+- 如果 JVM 进程缓存未命中，则查询数据库
+
+```text
+┌───────────┐
+│  客户端    │
+└────┬──────┘
+     │ 1. 请求静态资源
+     ▼
+┌────┴────────┐          ┌───────────────┐
+│   CDN缓存    │◀─────────┤ 命中则直接返回  │
+└────┬────────┘          └───────────────┘
+     │ 未命中，回源
+     ▼
+┌────┴────────┐          ┌───────────────┐
+│  Nginx缓存   │◀─────────┤   缓存+返回    │
+└────┬────────┘          └───────────────┘
+     │ 2. 请求动态数据
+     ▼
+┌────┴──────────────┐      ┌───────────────┐
+│   应用本地缓存      │◀─────┤ 本地缓存+返回   │
+└────┬──────────────┘      └───────────────┘
+     │ 3. 查分布式缓存
+     ▼
+┌────┴────────┐          ┌───────────────┐
+│  Redis集群   │◀─────────┤   返回数据     │
+└────┬────────┘          └───────────────┘
+     │ 4. 未命中则查库
+     ▼
+┌────┴────────┐          ┌───────────────┐
+│   数据库     │◀─────────┤   回填缓存     │
+└────┬────────┘          └───────────────┘
+     │ 最终响应回传
+     ▼
+┌────┴────────┐
+│  客户端      │
+└─────────────┘
+```
+
+### 1. JVM 进程缓存
+
+#### 1.1 安装 Docker
+
+下载前需要查看 WSL 配置文件，通过 cat /etc/wsl.conf 确保在引导选项中 systemd 被设置为 true。若尚未设置，需在配置中添加：
+
+```shell
+sudo nano /etc/wsl.conf
+
+[boot]
+systemd=true
+
+# 然后重启 WSL
+wsl --shutdown
+# 重新进入
+wsl
+```
+
+首先是安装 Docker 到 Ubuntu 中：
+
+```shell
+# 首先通过 curl 下载脚本
+curl -fsSL https://get.docker.com -o get-docker.sh  
+```
+
+执行脚本安装 Docker：
+
+```shell
+sudo sh get-docker.sh
+```
+
+通过 docker version 查看 Docker 引擎的客户端版本、服务器版本，以及引擎、containerd、runc 和 Docker init 的具体版本信息
+
+```shell
+docker version
+
+Client:
+ Version:           27.5.1
+ API version:       1.47
+ Go version:        go1.22.2
+ Git commit:        27.5.1-0ubuntu3~24.04.2
+ Built:             Mon Jun  2 11:51:53 2025
+ OS/Arch:           linux/amd64
+ Context:           default
+
+Server:
+ Engine:
+  Version:          27.5.1
+  API version:      1.47 (minimum version 1.24)
+  Go version:       go1.22.2
+  Git commit:       27.5.1-0ubuntu3~24.04.2
+  Built:            Mon Jun  2 11:51:53 2025
+  OS/Arch:          linux/amd64
+  Experimental:     false
+ containerd:
+  Version:          1.7.27
+  GitCommit:
+ runc:
+  Version:          1.2.5-0ubuntu1~24.04.1
+  GitCommit:
+ docker-init:
+  Version:          0.19.0
+  GitCommit:
+```
+
+安装好后尝试运行：
+
+```shell
+docker run hello-world
+
+# 提示权限被拒
+docker: Got permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: 
+dial unix /var/run/docker.sock: connect: permission denied.
+See 'docker run --help'.
+```
+
+所以需要将当前用户添加到 Docker 组中，让他具有使用命令的权限：
+
+```shell
+sudo usermod -aG docker $USER
+# 刷新用户组权限
+newgrp docker
+```
+
+查看是否添加进组成功：
+
+```shell
+id
+uid=1000(cell) gid=1000(cell) groups=1000(cell),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),100(users),109(docker)
+```
+
+再次尝试 docker run hello-world：
+
+```shell
+cell@LAPTOP-SVEUFK1D:/tmp/mysql$ docker run hello-world
+# 成功启动 Docker
+Hello from Docker!
+...
+```
+
+如果返回的是以下内容：
+
+```shell
+Unable to find image 'hello-world:latest' locally
+docker: Error response from daemon: Get "https://registry-1.docker.io/v2/": net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers).
+See 'docker run --help'.
+```
+
+证明这是网络的问题，需要给 Docker 配置网络代理：
+
+```shell
+# 代理设置
+sudo mkdir -p /etc/docker
+
+# 设置加速器（可用加速器经常变化，网络搜索最新的服务器）
+sudo tee /etc/docker/daemon.json <<EOF
+{
+    "registry-mirrors": [
+        "https://docker.xuanyuan.me",
+        "https://docker.m.daocloud.io",
+        "https://docker.1ms.run"
+    ]
+}
+EOF
+```
+
+重启docker服务，使其生效：
+
+```shell
+sudo systemctl daemon-reload && sudo systemctl restart docker
+```
+
+如果使用 docker run hello-world 输出了 Hello from Docker!，证明配置成功，解决了网络问题，然后配置 Docker 在 WSL 启动时自动运行：
+
+```shell
+# 启用 Docker 服务自启动
+sudo systemctl enable docker.service
+# 启用 containerd 服务自启动
+sudo systemctl enable containerd.service
+```
+
+验证状态：
+
+```shell
+systemctl status docker.service
+systemctl status containerd.service
+
+# 有输出 enable 证明设置成功
+Loaded: loaded (/usr/lib/systemd/system/docker.service; enabled; preset: enabled)
+                                                        ^^^^^^^ 
+```
+
+安装 Docker Compose：
+
+```shell
+# 24.0.2 版本之前可用
+sudo apt-get update  
+sudo apt-get install docker-compose-plugin  
+```
+
+如果是最新测试版的 Ubuntu（Noble）使用以上命令是无法成功安装的，因为这个还是测试版，它的插件包可能还没有发布，所以没法直接从 Ubuntu 的软件包仓库中下载，
+不过可以直接添加官方源，直接获取最新的 Docker 插件：
+
+安装依赖工具：
+
+```shell
+sudo apt update
+sudo apt install -y ca-certificates curl gnupg
+```
+
+添加 Docker 官方 GPG 密钥（校验软件包的来源和完整性）:
+
+```shell
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+```
+
+```shell
+cell@LAPTOP-SVEUFK1D:~$ ls -l /etc/apt/keyrings/docker.gpg
+# 导入成功
+-rw-r--r-- 1 root root 2760 Jul  3 21:49 /etc/apt/keyrings/docker.gpg
+```
+
+添加 Docker 官方软件源：
+
+```shell
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+```
+
+更新软件包索引并安装:
+
+```shell
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+验证安装：
+
+```shell
+# 检查 Docker 版本
+docker --version
+# 输出版本号
+Docker version 28.3.1, build 38b7060
+
+# 检查 Docker Compose 插件版本
+docker compose version
+# 输出版本号
+Docker Compose version v2.38.1
+
+# 检查 Docker 服务状态
+sudo systemctl status docker
+# 正常运行
+Active: active (running) since Thu 2025-07-03 22:05:59 CST; 2min 7s ago
+```
+
+****
+#### 1.2 利用 Docker 运行 MySQL 
+
+准备两个目录，用于挂载容器的数据和配置文件目录：
+
+```shell
+# 进入/tmp目录
+cd /tmp
+# 创建文件夹
+mkdir mysql
+# 进入mysql目录
+cd mysql
+```
+
+进入 mysql 目录后，执行下面的 Docker 命令：
+
+```shell
+docker run \
+ -p 3306:3306 \
+ --name mysql \
+ -v $PWD/conf:/etc/mysql/conf.d \
+ -v $PWD/logs:/logs \
+ -v $PWD/data:/var/lib/mysql \
+ -e MYSQL_ROOT_PASSWORD=123 \
+ --privileged \
+ -d \
+ mysql:8.0.33
+```
+
+查看容器是否运行成功：
+
+```shell
+docker ps
+# 成功运行
+CONTAINER ID   IMAGE          COMMAND                  CREATED             STATUS          PORTS                                                    NAMES
+da2d20b23750   mysql:8.0.33   "docker-entrypoint.s…"   About an hour ago   Up 16 seconds   0.0.0.0:3306->3306/tcp, [::]:3306->3306/tcp, 33060/tcp   mysql
+
+ll
+# 文件创建成功
+drwxr-xr-x  2 cell    cell 4096 Jul  3 20:54 conf/
+drwxr-xr-x  8 dnsmasq root 4096 Jul  3 22:11 data/
+drwxr-xr-x  2 root    root 4096 Jul  3 20:50 logs/
+```
+
+在 mysql 目录下通过 vi conf/my.cnf 创建文件，然后将以下内容粘贴进该文件，然后使用 docker restart mysql 重启容器：
+
+```shell
+[mysqld]
+skip-name-resolve
+character_set_server=utf8
+datadir=/var/lib/mysql
+server-id=1000
+```
+
+然后在 MySQL 中创建新的数据库，用 ip 作为连接名（172.23.14.3）
+
+****
+#### 1.3 导入一个 Demo 工程
+
+导入后需要注意更新 pom 依赖：
+
+```xml
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+    <version>3.5.9</version>
+</dependency>
+<!--于 v3.5.9 起，PaginationInnerInterceptor 已分离出来，如需使用，则需单独引入 mybatis-plus-jsqlparser 依赖-->
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-jsqlparser</artifactId>
+    <version>3.5.9</version>
+</dependency>
+```
+
+****
+#### 1.4 运行 nginx 服务
+
+上面的程序导入成功后，访问 http://localhost/item.html?id=10001 即可看到对应的数据库中的信息(写死的数据，不是动态的)，需要向服务器发送 ajax 请求，查询商品数据
+
+```text
+Request URL
+http://localhost/api/item/10001
+Referrer Policy
+strict-origin-when-cross-origin
+```
+
+查看 nginx 的 conf 目录下的 nginx.conf 文件：
+
+```text
+#user  nobody;
+worker_processes  1;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    sendfile        on;
+    #tcp_nopush     on;
+    keepalive_timeout  65;
+    # nginx的业务集群，做nginx本地缓存、redis缓存、tomcat缓存
+    upstream nginx-cluster{
+        # 虚拟机的 ip 地址，也就是 nginx 业务集群要部署的地方
+        server 172.23.14.3:8081;
+    }
+    server {
+        listen       80;
+        server_name  localhost;
+    # 监听 /api 路径，反向代理到 nginx-cluster 集群
+	location /api {
+            proxy_pass http://nginx-cluster;
+        }
+
+        location / {
+            root   html;
+            index  index.html index.htm;
+        }
+
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   html;
+        }
+    }
+}
+```
+
+Nginx 监听 80 端口，此时访问的 /item.html 资源来源于 Nginx 的 html 目录，然后 /api 请求会被反向代理到后端 172.23.14.3:8081，即 SpringBoot 项目：
+
+```text
+浏览器 -> Nginx :80 -> 后端服务(SpringBoot) -> 前端页面
+浏览器访问：http://localhost/api/item/10001 ，Nginx 把请求转发：http://172.23.14.3:8081/api/item/10001 ，SpringBoot 接收到请求，内部连数据库
+浏览器 Ajax -> Nginx :80 -> /api/item/10001 -> 后端服务(SpringBoot)
+```
+
+****
+
+
+
+
+
+
+
+
 
 
 
