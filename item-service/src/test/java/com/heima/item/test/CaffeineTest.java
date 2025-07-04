@@ -8,32 +8,25 @@ import java.time.Duration;
 
 public class CaffeineTest {
 
-    /*
-      基本用法测试
-     */
+    // 基本用法测试
     @Test
     void testBasicOps() {
         // 创建缓存对象
         Cache<String, String> cache = Caffeine.newBuilder().build();
-
         // 存数据
-        cache.put("gf", "迪丽热巴");
-
+        cache.put("name", "张三");
         // 取数据，不存在则返回null
-        String gf = cache.getIfPresent("gf");
-        System.out.println("gf = " + gf);
-
+        String name = cache.getIfPresent("name");
+        System.out.println("name = " + name);
         // 取数据，不存在则去数据库查询
-        String defaultGF = cache.get("defaultGF", key -> {
-            // 这里可以去数据库根据 key查询value
-            return "柳岩";
+        String defaultName = cache.get("defaultName", key -> {
+            // 这里可以去数据库根据 key 查询 value
+            return "李四";
         });
-        System.out.println("defaultGF = " + defaultGF);
+        System.out.println("defaultName = " + defaultName);
     }
 
-    /*
-     基于大小设置驱逐策略：
-     */
+    // 基于大小设置驱逐策略
     @Test
     void testEvictByNum() throws InterruptedException {
         // 创建缓存对象
@@ -42,20 +35,18 @@ public class CaffeineTest {
                 .maximumSize(1)
                 .build();
         // 存数据
-        cache.put("gf1", "柳岩");
-        cache.put("gf2", "范冰冰");
-        cache.put("gf3", "迪丽热巴");
+        cache.put("name1", "张三");
+        cache.put("name2", "李四");
+        cache.put("name3", "王五");
         // 延迟10ms，给清理线程一点时间
         Thread.sleep(10L);
         // 获取数据
-        System.out.println("gf1: " + cache.getIfPresent("gf1"));
-        System.out.println("gf2: " + cache.getIfPresent("gf2"));
-        System.out.println("gf3: " + cache.getIfPresent("gf3"));
+        System.out.println("name1" + cache.getIfPresent("name1"));
+        System.out.println("name2: " + cache.getIfPresent("name2"));
+        System.out.println("name3: " + cache.getIfPresent("name3"));
     }
 
-    /*
-     基于时间设置驱逐策略：
-     */
+    // 基于时间设置驱逐策略
     @Test
     void testEvictByTime() throws InterruptedException {
         // 创建缓存对象
@@ -63,11 +54,11 @@ public class CaffeineTest {
                 .expireAfterWrite(Duration.ofSeconds(1)) // 设置缓存有效期为 10 秒
                 .build();
         // 存数据
-        cache.put("gf", "柳岩");
+        cache.put("name", "赵六");
         // 获取数据
-        System.out.println("gf: " + cache.getIfPresent("gf"));
+        System.out.println("name: " + cache.getIfPresent("name"));
         // 休眠一会儿
         Thread.sleep(1200L);
-        System.out.println("gf: " + cache.getIfPresent("gf"));
+        System.out.println("name: " + cache.getIfPresent("name"));
     }
 }

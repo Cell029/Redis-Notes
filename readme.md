@@ -5056,6 +5056,809 @@ Nginx 监听 80 端口，此时访问的 /item.html 资源来源于 Nginx 的 ht
 ```
 
 ****
+#### 1.5 初识 Caffeine
+
+Caffeine 是 Java 平台下的本地高性能缓存库，它广泛用于对性能要求极高的系统，到需要高频率、低延迟的需求时可以考虑使用。
+
+基本用法：
+
+```java
+// 创建缓存对象
+Cache<String, String> cache = Caffeine.newBuilder().build();
+// 存数据
+cache.put("name", "张三");
+// 取数据，不存在则返回null
+String name = cache.getIfPresent("name");
+System.out.println("name = " + name);
+// 取数据，不存在则去数据库查询（也被叫做备选方案）
+String defaultName = cache.get("defaultName", key -> {
+    // 这里可以去数据库根据 key 查询 value
+    // key 对应的其实就是 defaultName，只不过换个名字提高可读性
+    return "李四";
+});
+System.out.println("defaultName = " + defaultName);
+```
+
+Caffeine 提供了三种缓存驱逐策略：
+
+- **基于容量**：设置缓存的数量上限
+
+```java
+// 创建缓存对象
+Cache<String, String> cache = Caffeine.newBuilder()
+        // 设置缓存大小上限为 1，只能存放一条数据
+        .maximumSize(1)
+        .build();
+// 存数据
+cache.put("name1", "张三");
+cache.put("name2", "李四");
+cache.put("name3", "王五");
+// 延迟 10 ms，给清理线程一点时间
+Thread.sleep(10L);
+// 获取数据，最终只会输出一个 name 的值
+System.out.println("name1" + cache.getIfPresent("name1"));
+System.out.println("name2: " + cache.getIfPresent("name2"));
+System.out.println("name3: " + cache.getIfPresent("name3"));
+```
+
+- **基于时间**：设置缓存的有效时间
+
+```java
+// 创建缓存对象
+Cache<String, String> cache = Caffeine.newBuilder()
+        .expireAfterWrite(Duration.ofSeconds(1)) // 设置缓存有效期为 10 秒
+        .build();
+// 存数据
+cache.put("name", "赵六");
+// 获取数据
+System.out.println("name: " + cache.getIfPresent("name")); // 赵六
+// 休眠一会儿
+Thread.sleep(1200L);
+System.out.println("name: " + cache.getIfPresent("name")); // null
+```
+
+还有一些常用的参数：
+
+- maximumSize(long size)：限制缓存最大条目数
+- maximumWeight(long weight)：按权重限制总缓存容量（需配合 weigher()）
+- expireAfterWrite(time)：写入后多长时间数据过期
+- expireAfterAccess(time)：最后一次访问后多长时间数据过期
+- refreshAfterWrite(time)：写入后多长时间异步刷新（不影响读取，后台更新）
+- recordStats()：开启统计功能，获取命中率、加载次数
+- weakKeys()、weakValues()：弱引用key或value，避免内存泄漏，适合短生命周期数据
+- removalListener()：监听缓存移除事件
+
+****
+#### 1.6 实现 JVM 进程缓存
+
+创建一个缓存配置文件，专门用来创建 Caffeine 缓存，并且让它们纳入 IoC 管理，避免以后多次手动创建缓存：
+
+```java
+// 创建商品缓存
+@Bean
+public Cache<Long, Item> itemCache(){
+    return Caffeine.newBuilder()
+            .initialCapacity(100)
+            .maximumSize(10_000)
+            .build();
+}
+// 创建库存缓存
+@Bean
+public Cache<Long, ItemStock> stockCache(){
+    return Caffeine.newBuilder()
+            .initialCapacity(100) // 设置缓存初始容量
+            .maximumSize(10_000) // 最大缓存上限
+            .build();
+}
+```
+
+浏览器输入对应的 URL 后，第一次控制台会输出对应的查询数据库的 SQL 日志：
+
+```sql
+SELECT id,name,title,price,image,category,brand,spec,status,create_time,update_time FROM tb_item WHERE (status <> ? AND id = ?)
+```
+
+再次查询后就不再输出了，证明走的是缓存
+
+```java
+// 查商品
+return itemCache.get(id, key -> itemService.query()
+                .ne("status", 3).eq("id", key)
+                .one()
+        );
+
+// 查库存
+return stockCache.get(id, key -> stockService.getById(key));
+```
+
+****
+### 2. Lua 语法入门
+
+Lua 是一种轻量小巧的脚本语言，用标准 C 语言编写并以源代码形式开放，其设计目的是为了嵌入应用程序中，从而为应用程序提供灵活的扩展和定制功能。而 Nginx 本身也是 C 语言开发的，因此也允许基于 Lua 做拓展。
+
+#### 2.1 变量与数据类型
+
+Lua 是动态类型语言，变量无需声明类型，而是用 local 来声明变量为局部变量，作用于当前文件(不使用 local 那就是全局变量)：
+
+```lua
+local a = 10        -- 整数
+local b = 3.14      -- 浮点数
+local c = "hello" .. 'world'  -- 声明字符串，可以用单引号或双引号，用 .. 拼接
+local d = true      -- 布尔值
+local e = nil       -- 空值
+```
+
+Lua 中的 table 类型既可以作为数组，又可以作为 Java 中的 map 来使用，数组就是特殊的 table，key 是数组角标而已：
+
+```lua
+-- 声明数组 ，key 为角标的 table
+local arr = {'java', 'python', 'lua'}
+-- 声明 table，类似 java 的 map
+local map =  {name='Jack', age=21}
+```
+
+Lua 中的数组角标是从 1 开始，访问的时候与 Java 中类似：
+
+```lua
+-- 访问数组，lua数组的角标从1开始
+do -- 因为使用的是局部变量，如果不在同一行可能就访问不到，所以用 do ... end 包裹起来
+    local arr = {'java', 'python', 'lua'}
+    print(arr[1])  -- 正确输出 "java"
+end
+```
+
+Lua 中的 table 可以用 key 来访问：
+
+```lua
+print(map['name']) -- Jack
+print(map.name) -- Jack
+print(map)
+table: 0x604f55ac8390
+```
+
+数据类型，可以利用 type 函数测试给定的变量或值的类型：
+
+- nil：表示无值、空
+- boolean：布尔值 true 或 false
+- number：数值类型（整数、浮点数）
+- string：字符串
+- table：表（数组、字典、对象统一结构）
+- function：函数
+- userdata：自定义 C 数据类型
+- thread：协程
+
+例如：
+
+```shell
+> print(type(true))
+boolean # true 是布尔类型
+> print(type(print))
+function # print 是函数类型
+```
+
+
+通过 lua 命令进入 lua 的控制台，测试 lua 语法：
+
+```shell
+cell@LAPTOP-SVEUFK1D:~$ lua
+Lua 5.3.6  Copyright (C) 1994-2020 Lua.org, PUC-Rio
+```
+
+****
+#### 2.2 循环
+
+对于 table 可以利用 for 循环来遍历，不过数组和普通 table 遍历略有差异：
+
+遍历数组：
+
+```lua
+-- 声明数组 key为索引的 table
+local arr = {'java', 'python', 'lua'}
+-- 遍历数组
+for index,value in ipairs(arr) do -- do 代表大括号的开始
+    print(index, value) 
+end -- end 代表大括号的结束
+```
+
+```lua
+1       java
+2       python
+3       lua
+```
+
+遍历普通 table：
+
+```lua
+-- 声明map，也就是table
+local map = {name='Jack', age=21}
+-- 遍历 table
+for key,value in pairs(map) do
+   print(key, value) 
+end
+```
+
+```lua
+age     21
+name    Jack
+```
+
+- ipairs：是一个用于顺序遍历数组（数字索引表）的迭代器函数。它会从索引 1 开始，依次遍历表中的连续整数键（1, 2, 3, ...），直到遇到第一个 nil 值为止
+- pairs：是一个用于遍历表中所有键值对的迭代器函数，它会遍历表中的所有键（无论类型是数字、字符串还是其他），并返回对应的键和值。但 pairs 不保证遍历顺序，但能确保遍历所有元素。
+
+****
+#### 2.3 条件控制、函数
+
+定义函数的语法：
+
+```lua
+function 函数名( argument1, argument2..., argumentn)
+    -- 函数体
+    return 返回值
+end
+```
+
+例如，定义一个函数，用来打印数组：
+
+```lua
+function printArr(arr)
+    for index, value in ipairs(arr) do
+        print(value)
+    end
+end
+```
+
+类似 Java 的条件控制，例如 if、else 语法：
+
+```lua
+if(布尔表达式)
+then
+   --[ 布尔表达式为 true 时执行该语句块 --]
+else
+   --[ 布尔表达式为 false 时执行该语句块 --]
+end
+```
+
+与 java 不同，布尔表达式中的逻辑运算是基于英文单词：
+
+- and：逻辑与操作符
+- or：逻辑或操作符
+- not：逻辑非操作符
+
+例如：自定义一个函数，可以打印 table，当参数为 nil 时，打印错误信息
+
+```lua
+function printArr(arr)
+    if not arr then
+        print('数组不能为空！')
+        return -- 结束运行
+    end
+    for index, value in ipairs(arr) do
+        print(value)
+    end
+end
+```
+
+****
+### 3. 实现多级缓存
+
+#### 3.1 安装 OpenResty
+
+1、更新系统并安装依赖
+
+```shell
+sudo apt update
+sudo apt upgrade -y
+sudo apt install -y wget gnupg software-properties-common
+```
+
+2、添加 OpenResty 官方 APT 仓库
+
+```shell
+wget -O - https://openresty.org/package/pubkey.gpg | sudo apt-key add -
+sudo add-apt-repository -y "deb http://openresty.org/package/ubuntu $(lsb_release -sc) main"
+sudo apt update
+```
+
+3、安装 OpenResty
+
+```shell
+sudo apt install -y openresty
+```
+
+4、验证安装
+
+```shell
+openresty -v
+# 输出版本号
+nginx version: openresty/1.27.1.2
+```
+
+5、启动 OpenResty 服务
+
+```shell
+sudo systemctl start openresty
+sudo systemctl enable openresty  # 设置开机自启
+```
+
+检查服务状态：
+
+```shell
+sudo systemctl status openresty
+# 正常运行
+Loaded: loaded (/usr/lib/systemd/system/openresty.service; enabled; preset: enabled)
+Active: active (running) 
+```
+
+6、配置 nginx 的环境变量
+
+```shell
+sudo vi /etc/profile
+```
+
+然后在最下面加入两行：
+
+```shell
+export NGINX_HOME=/usr/local/openresty/nginx
+export PATH=${NGINX_HOME}/sbin:$PATH
+```
+
+然后让配置生效：
+
+```shell
+source /etc/profile
+```
+
+nginx 的默认配置文件注释太多，影响后续的编辑，这里将 nginx.conf 中的注释部分删除，保留有效部分，修改 /usr/local/openresty/nginx/conf/nginx.conf 文件，内容如下：
+
+```shell
+#user  nobody;
+worker_processes  1;
+error_log  logs/error.log;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+    sendfile        on;
+    keepalive_timeout  65;
+
+    server {
+        listen       8081;
+        server_name  localhost;
+        location / {
+            root   html;
+            index  index.html index.htm;
+        }
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   html;
+        }
+    }
+}
+```
+
+启动命令：
+
+```shell
+# 启动 nginx（绝对路径启动）
+sudo /usr/local/openresty/nginx/sbin/nginx
+# 配置软连接后直接使用即可（sudo nginx、sudo nginx -s reload、nginx -s stop）
+sudo ln -s /usr/local/openresty/nginx/sbin/nginx /usr/local/bin/nginx
+# 重新加载配置
+sudo /usr/local/openresty/nginx/sbin/nginx -s reload
+# 停止
+sudo /usr/local/openresty/nginx/sbin/nginx -s stop
+```
+
+在浏览器输入 http://172.23.14.3:8081，看到 Welcome to OpenResty! 证明安装成功。
+
+****
+#### 3.2 反向代理流程
+
+windows 上的 nginx 用来做反向代理服务，将前端的查询商品的 ajax 请求代理到 OpenResty 集群，然后 OpenResty 集群用来编写多级缓存业务，因为 nginx 会监听浏览器发送的请求，
+然后讲请求代理给集群处理，
+
+```shell
+# 修改 /usr/local/openresty/nginx/conf/nginx.conf 文件（或已经写好的别人的），在其中的 http 下面，添加下面代码
+# 主要作用是让 OpenResty 能够正确加载手动编写的 Lua 脚本或第三方 Lua/C 模块
+#lua 模块
+lua_package_path "/usr/local/openresty/lualib/?.lua;;";
+#c模块     
+lua_package_cpath "/usr/local/openresty/lualib/?.so;;";  
+```
+
+```shell
+server {
+    listen 8081;
+    server_name localhost;
+    # 修改 /usr/local/openresty/nginx/conf/nginx.conf 文件，在 nginx.conf 的 server 下面，添加对 /api/item 这个路径的监听
+    location /api/item {
+        default_type application/json; # 格式为 json
+        content_by_lua_file lua/item.lua;
+    }
+    location / {
+        root html;
+        index index.html index.htm;
+    }
+}
+```
+
+例如现在监听的是 /api/item 和 / 路径，发送这些 URL 后就会跳转到对应的处理，发送 / 就直接进入 nginx 的欢迎页面，发送 /api/item 就是进入手动添加的一个 lua 文件，
+这个监听，就类似于 SpringMVC 中的 @GetMapping("/api/item") 做路径映射，而 content_by_lua_file lua/item.lua 则相当于调用 item.lua 这个文件，
+执行其中的业务，把结果返回给用户，也就是相当于 java 中调用 service。
+
+****
+#### 3.3 编写 item.lua
+
+在 /usr/local/openresty/nginx 目录创建文件夹 lua 并进入该目录，然后创建 item.lua 文件:
+
+```shell
+cd /usr/local/openresty/nginx
+sudo mkdir lua
+cd lua
+sudo vi item.lua
+```
+
+在 item.lua 中利用 ngx.say() 函数将数据返回到 response 中：
+
+```shell
+ngx.say('{"id":10001,"name":"SALSA AIR",...)
+```
+
+然后重新加载配置：
+
+```shell
+sudo -s reload
+```
+
+****
+#### 3.3 请求参数处理
+
+OpenResty 中提供了一些 API 用来获取不同类型的前端请求参数：
+
+1、获取 URL 路径参数（Path Parameters）
+
+当 URL 中包含动态路径部分时（如 /user/123），可以使用 location 块的正则匹配捕获参数：
+
+```nginx
+-- '~' 表示要使用正则表达式，(\d+) 表示对正则表达式分组，\d 代表所有的数字，+ 代表至少一个字符
+location ~ ^/user/(\d+)$ {
+    # 使用 $1 访问第一个捕获组（即用户 ID）
+    content_by_lua_block {
+        -- 匹配到的参数会存入 ngx.var 数组中，可以通过角标获取
+        local user_id = ngx.var[1]  -- 获取第一个正则捕获组，若路径为 /user/123，则 ngx.var[1] 的值为 123
+        -- 可以直接调用函数，也可以交给一个 item.lua 文件处理
+        ngx.say("User ID: ", user_id)
+        -- content_by_lua_file lua/item.lua;
+    }
+}
+```
+
+例如：
+
+在 nginx.conf 文件中这样配置 location：
+
+```nginx
+ location ~ /api/item/(\d+) {
+    # 默认的响应类型
+    default_type application/json;
+    # 响应结果由lua/item.lua文件来决定
+    content_by_lua_file lua/item.lua;
+}
+```
+
+在 item.lua 中这样配置：
+
+```nginx
+-- 获取商品id
+local id = ngx.var[1]
+-- 拼接并返回
+ngx.say('{"id":' .. id .. ',"name":"SALSA AIR",...')
+```
+
+然后重启服务，在浏览器中带上 id 重新输入 URL：http://localhost:8081/api/item/10002 ，显示的内容 id 会变成 1002，
+
+2、获取 URL 查询参数（GET 参数）
+
+对于 URL 中的查询字符串（如 ?name=john&age=25），使用 ngx.req.get_uri_args() 解析：
+
+```nginx
+location /search {
+    content_by_lua_block {
+        local args = ngx.req.get_uri_args()  -- 返回一个包含所有参数的 Lua 表（键值对，table 类型）
+        -- 例如：获取单个参数（带默认值）；对于重复参数（如 ?id=1&id=2），返回数组：args.id = {1, 2}
+        local name = args.name or "guest"
+        local age = tonumber(args.age) or 0 
+        ngx.say("Name: ", name)
+        ngx.say("Age: ", age)
+    }
+}
+```
+
+3、获取请求头参数（Headers）
+
+使用 ngx.req.get_headers() 获取请求头信息：
+
+```nginx
+location /headers {
+    content_by_lua_block {
+        local headers = ngx.req.get_headers()  -- 获取所有请求头
+        -- 获取特定请求头（忽略大小写）
+        local user_agent = headers["User-Agent"]
+        local token = headers["Authorization"] or ""
+        ngx.say("User-Agent: ", user_agent)
+        ngx.say("Authorization: ", token)
+    }
+}
+```
+
+4、获取 POST 表单参数
+
+```nginx
+location /login {
+    content_by_lua_block {
+        ngx.req.read_body()  -- 必须先读取请求体
+        local args = ngx.req.get_post_args()  -- 获取 POST 参数
+        local username = args.username or ""
+        local password = args.password or ""
+        ngx.say("Username: ", username)
+        ngx.say("Password: ", password)
+    }
+}
+```
+
+5、获取 JSON 请求体
+
+对于 application/json 格式的请求体，同样需要先读取请求体，再解析 JSON：
+
+```nginx
+location /api {
+    content_by_lua_block {
+        ngx.req.read_body()  -- 先读取请求体
+        local data = ngx.req.get_body_data()  -- 获取原始请求体内容
+        if data then
+            local cjson = require("cjson")  -- 引入 JSON 解析库
+            local ok, json_data = pcall(cjson.decode, data)
+            if ok then
+                -- 解析成功，访问 JSON 字段
+                local name = json_data.name or ""
+                local age = json_data.age or 0
+                ngx.say("Name: ", name)
+                ngx.say("Age: ", age)
+            else
+                ngx.status = 400
+                ngx.say("Invalid JSON")
+            end
+        else
+            ngx.status = 400
+            ngx.say("No request body")
+        end
+    }
+}
+```
+
+****
+#### 3.4 查询 Tomcat
+
+拿到商品 ID 后，本应去缓存中查询商品信息，不过目前还未建立 nginx、redis 缓存。因此，这里先根据商品 id 去 tomcat 查询商品信息。
+需要注意的是，OpenResty 是在虚拟机，Tomcat 是在 Windows 电脑上，两者 IP 一定不要搞错了，如果 ip 填写错误就会导致访问不到 Windows 本地的 Tomcat 服务，
+在 WSL2 中使用 ip route 查看主机 IP 地址：
+
+```shell
+ip route
+# 主机 ip 为 172.23.0.1
+default via 172.23.0.1 dev eth0 proto kernel
+```
+
+在 nginx 中，它提供了内部 API 用以发送 http 请求并处理响应的 Lua 模块，专门设计用于 OpenResty (Nginx + Lua) 环境：
+
+```nginx
+-- 这里的 path 是路径，并不包含 IP 和端口。这个请求会被 nginx 内部的 server 监听并处理。
+local resp = ngx.location.capture("/path",{
+    method = ngx.HTTP_GET,   -- 请求方式
+    args = {a=1,b=2},  -- get方式传参数
+})
+```
+
+返回的响应内容包括：
+
+- resp.status：响应状态码
+- resp.header：响应头，是一个table
+- resp.body：响应体，就是响应数据
+
+如果希望这个请求发送到 Tomcat 服务器，那么就还需要编写一个 server 来对这个路径做反向代理：
+
+```nginx
+location /item {
+ # 这里是 windows 电脑的 ip 和 Java 服务端口，需要确保 windows 防火墙处于关闭状态
+ proxy_pass http://172.23.0.1:8081; 
+}
+```
+
+也就是说当 ngx.location.capture 发起请求后，会被反向代理到 windows 上的 Java 服务的 IP 和端口，
+所以最终的请求就是：GET http://172.23.0.1:8081/path?a=1&b=2
+
+****
+#### 3.5 封装 http 工具
+
+要基于 ngx.location.capture 来实现查询 tomcat，就得手动配置反向代理，设置好具体的 IP 与端口，并自定义 nginx 的内置 API。
+
+1、添加反向代理到 Windows 的 Java 服务
+
+因为 item-service 项目中的接口都是 /item 开头，所以需要监听的是 /item 路径，然后这个路径代理到 Windows 上的 tomcat 服务上，
+修改 /usr/local/openresty/nginx/conf/nginx.conf 文件，添加一个 location：
+
+```shell
+sudo vi /usr/local/openresty/nginx/conf/nginx.conf
+# 在 nginx.conf 中添加以下内容
+location /item {
+    proxy_pass http://172.23.0.1:8081;
+}
+```
+
+当调用 ngx.location.capture("/item") 时，就能成功发送请求到 Windows 的 tomcat 上。
+
+2、自定义 nginx 的内置 API
+
+前面内容提到过，OpenResty 启动时会加载以下两个目录中的工具文件：
+
+```shell
+#lua 模块
+lua_package_path "/usr/local/openresty/lualib/?.lua;;";
+#c模块     
+lua_package_cpath "/usr/local/openresty/lualib/?.so;;";  
+```
+
+所以自定义的 http 工具就可以放到 lualib 目录下，在 /usr/local/openresty/lualib 目录下，新建一个 common.lua 文件：
+
+```shell
+sudo vi /usr/local/openresty/lualib/common.lua
+# 将以下内容写入 common.lua 文件中
+# 封装函数，发送 http 请求，并解析响应
+# 接收两个参数，一个路径，一个 GET 请求的参数表
+local function read_http(path, params)
+    local resp = ngx.location.capture(path,{
+        method = ngx.HTTP_GET,
+        args = params,
+    })
+    if not resp then
+        -- 记录错误信息，返回404
+        ngx.log(ngx.ERR, "http请求查询失败, path: ", path , ", args: ", args)
+        ngx.exit(404)
+    end
+    return resp.body
+end
+-- 将方法导出
+local _M = {  
+    read_http = read_http
+}  
+return _M
+```
+
+这个工具将 read_http 函数封装到 _M 这个 table 类型的变量中，然后返回这个 table 表实现类似导出的效果。
+
+3、实现商品查询
+
+最后，修改 /usr/local/openresty/lua/item.lua 文件，利用刚刚封装的函数库实现对 tomcat 的查询：
+
+```nginx
+-- 引入自定义common工具模块，返回值是common中返回的 _M
+local common = require("common")
+-- 从 common中获取read_http这个函数
+local read_http = common.read_http
+-- 获取路径参数
+local id = ngx.var[1]
+-- 根据id查询商品
+local itemJSON = read_http("/item/".. id, nil)
+-- 根据id查询商品库存
+local itemStockJSON = read_http("/item/stock/".. id, nil)
+-- 测试：返回数据
+ngx.say(itemJSON)
+```
+
+当通过访问 /api/item 路径时，就会去访问 item.lua 文件，然后就可以调用 require("common")，此时会查找名为 common.lua 的文件并执行该文件的内容，最后返回该文件最后返回的值（即 _M 表）
+
+```nginx
+location /api/item {
+    default_type application/json; # 格式为 json
+    content_by_lua_file lua/item.lua;
+}
+```
+
+最终这里查询到的结果是 json 字符串，并且包含商品、库存两个 json 字符串（商品和库存信息），但页面最终需要的是把两个 json 拼接为一个 json，
+所以需要先把 JSON 变为 lua 的 table 类型，在 item.lua 文件中完成数据整合后，再转为 JSON。
+
+OpenResty 提供了一个 cjson 的模块用来处理 JSON 的序列化和反序列化：
+
+1. 引入 cjson 模块
+
+```nginx
+local cjson = require "cjson"
+```
+
+2. 序列化
+
+```nginx
+local obj = {
+    name = 'jack',
+    age = 21
+}
+-- 把 table 序列化为 json
+local json = cjson.encode(obj)
+```
+
+3. 反序列化
+
+```nginx
+local json = '{"name": "jack", "age": 21}'
+-- 反序列化 json 为 table
+local obj = cjson.decode(json);
+print(obj.name)
+```
+
+在 item.lua 文件中添加 json 处理的功能：
+
+```nginx
+local common = require('common')
+...
+-- JSON转化为lua的table
+local item = cjson.decode(itemJSON)
+local stock = cjson.decode(itemStockJSON)
+
+-- 组合数据
+item.stock = stock.stock
+item.sold = stock.sold
+
+-- 把 item 序列化为 json 返回结果
+ngx.say(cjson.encode(item))
+```
+
+****
+#### 3.6 基于 ID 负载均衡
+
+上面的代码中的 tomcat 是单机部署，而单机无法承载高并发，所以实际开发中 tomcat 一定是集群模式，不过 tomcat 集群本身不自带分发能力，所以需要负载均衡器配合使用，
+而默认的负载均衡模式是轮询模式。在 Tomcat 集群中，每台 Tomcat 内部都有自己的 JVM 本地缓存（例如 Caffeine），但 JVM 缓存无法在多台 Tomcat 之间共享，
+所以轮询负载均衡就会带来问题：
+
+- 第一次请求：轮询到 8081，JVM 缓存建立
+- 第二次请求：轮询到 8082，缓存未命中，重新查库
+- 第三次请求：轮询到 8081，命中缓存
+
+缓存生效依赖于是否轮询回同一个 tomcat，这就会造成命中率低，性能浪费。对于上面的代码，可以让同一商品请求固定路由到同一 tomcat，基于商品 ID 做负载均衡，
+避免同一商品轮询不同的 tomcat 导致每次都重新查库建立缓存。
+
+而 nginx 提供了基于请求路径做负载均衡的算法：
+
+```nginx
+hash $request_uri;
+```
+
+根据请求路径（如 /item/10001）做哈希，让哈希值对 Tomcat 数量取余，然后再决定落在哪台机器，只要 item 后面跟的 id 不变，那就可以保证同个商品一定一直访问同一个 tomcat，
+确保 JVM 缓存生效。
+
+首先，定义 tomcat 集群，并设置基于路径做负载均衡：
+
+```nginx
+upstream tomcat-cluster {
+    hash $request_uri;
+    server 172.23.0.1:8081;
+    server 172.23.0.1:8082;
+}
+```
+
+修改 /usr/local/openresty/nginx/conf/nginx.conf 文件，实现基于 ID 做负载均衡：
+
+```nginx
+location /item {
+    # proxy_pass http://172.23.0.1:8081;
+    proxy_pass http://tomcat-cluster;
+}
+```
+
+****
 
 
 
