@@ -6962,12 +6962,186 @@ Redis 是串行执行命令的，当一次性将多条命令发送到 Redis 时�
 
 ### 1. 动态字符串
 
+Redis 中保存的 Key 是字符串，value 往往也是字符串或者字符串的集合，不过 Redis 没有直接使用 C 语言中的字符串，因为 C 语言字符串存在很多问题，
+例如获取字符串长度的需要通过运算，且是非二进制安全的，声明的字符串（底层为数组）不可修改等，所以 Redis 构建了一种新的字符串结构，称为简单动态字符串（Simple Dynamic String），
+简称 SDS。例如执行 set name Jack，Redis 在底层会创建两个 SDS，一个包含 name，另一个包含 Jack。
 
+Redis 的 SDS 结构有五种，分别是 sdshdr5、sdshdr8、sdshdr16、sdshdr32、sdshdr64，它们分别对应使用的字节大小，
 
+```c
+#define SDS_TYPE_5  0 // 对应 sdshdr5，表示 3 位，即 31 字节以内
+#define SDS_TYPE_8  1 // 对应 sdshdr8，表示 1 - 255 字节
+#define SDS_TYPE_16 2 // 对应 sdshdr16，表示 2 - 65535 字节（64KB）
+#define SDS_TYPE_32 3 // 对应 sdshdr32，表示 4 字节 - 4GB 
+#define SDS_TYPE_64 4 // 对应 sdshdr64，表示 8 字节 - 18EB
+```
 
+SDS 结：
 
+```c
+struct __attribute__ ((__packed__)) sdshdr8 {
+    uint8_t len; // 已保存的字符串字节数，不包含结束标识
+    uint8_t alloc; // 申请的总的字节数，不包含结束标识
+    unsigned char flags; // 不同 SDS 类型，用来控制 SDS 的头大小，即 SDS_TYPE_8
+    char buf[]; // 存放实际字符串内容
+};
+```
 
+sdshdr5 与其他类型不同，没有单独的 len 和 alloc 字段，长度直接存储在 flags 的高 5 位（最多 31 位），只适用于非常短的字符串优化
 
+```c
+struct __attribute__ ((__packed__)) sdshdr5 {
+    unsigned char flags; // 低3位存类型，高5位存长度
+    char buf[];
+};
+```
+
+例如一个存储 "Hello" 的 sdshdr8：
+
+```text
++-----+------+-------+-------------------+
+| len | alloc| flags |      buf          |
++-----+------+-------+-------------------+
+|  5  |  10  |   1   |'H''e''l''l''o''\0'|
++-----+------+-------+-------------------+
+```
+
+len 代表该字符串的长度（英文、数字、标点通常只占一字节，中文占三字节    ），alloc 代表已分配的物理总空间，flags 代表使用的使用的是哪种类型，末尾的 0 是自动添加的空终止符，但实际上 Redis 根据 len 的长度来判断是否读取结束，即读取前五个元素即可。
+
+SDS 之所以叫做动态字符串，是因为它具备动态扩容的能力，例如一个内容为 “hi” 的 SDS：
+
+```text
++-----+------+-------+---------------+
+| len | alloc| flags |      buf      |
++-----+------+-------+---------------+
+|  3  |  3   |   1   | 'h''i'',''\0' | 
++-----+------+-------+---------------+
+```
+
+Redis 根据新字符串总长度，决定如何扩容，当新字符串总长度小于 1 MB，则新空间为扩展后字符串长度的两倍 +1（加一个终止符，但不会计入 len 中）；如果新字符串大于 1MB，则新空间为扩展后字符串长度 +1MB +1
+
+```text
++-----+------+-------+-----------------------+
+| len | alloc| flags |        buf            |
++-----+------+-------+-----------------------+
+|  6  |  12  |   1   |'h''i'',''A''m''y''\0' |
++-----+------+-------+-----------------------+
+```
+
+因为这种结构的特性，Redis 可以在 O(1) 时间复杂度内获取长度（读取 len），并且拼接前会进行长度判断，以及申请的本地空间可以有效减少空间分配的次数。
+
+****
+### 2. intset
+
+IntSet 是 Redis 内部用来实现 Set 集合的一种底层数据结构，基于整数数组来实现，并且具备长度可变、有序等特征，适用于集合中的所有元素都是整数且个数较少的情况。
+
+```c
+typedef struct intset {
+    uint32_t encoding; // 编码方式，支持存放 16 位、32 位、64 位整数
+    uint32_t length; // 元素个数
+    int8_t contents[]; // 实际存储整数元素的数组
+} intset; 
+```
+
+其中的 encoding 包含三种模式，表示存储的整数大小不同：
+
+```c
+#define INTSET_ENC_INT16 (sizeof(int16_t)) // 2 字节整数，类似于 Java 的 short
+#define INTSET_ENC_INT32 (sizeof(int32_t)) // 4 字节整数，类似于 Java 的 int
+#define INTSET_ENC_INT64 (sizeof(int64_t)) // 8 字节整数，类似于 Java 的 long
+```
+
+为了方便查找，Redis 会将 intset 中所有的整数按照升序依次保存在 contents 数组中：
+
+```text
++------------------+--------+-------+-------+-------+
+|     encoding     | length |   1   |   3   |   5   |
++------------------+--------+-------+-------+-------+
+| INTSET_ENC_INT16 |   3    |   1   |   3   |   5   |
++------------------+--------+-------+-------+-------+
+  ()
+```
+
+数组中每个数字都在 int16_t 的范围内，因此采用的编码方式是 INTSET_ENC_INT16，每部分占用的字节大小为：
+
+- encoding：4 字节
+- length：4 字节
+- contents：2 * 3 = 6 字节
+
+contents 数组中存放的每个整数的大小都是一样的，因为这样就保证了可以基于下标快速查找，而且元素是从 0 开始计算的，所以可以得到一个数学公式：address = start + (sizeof(int_16) * index)，
+
+但当向其中添加一个数字 50000，这个数字就超过了 int16_t 的范围，此时 intset 就会自动升级编码方式到合适的大小：
+
+- 升级编码为INTSET_ENC_INT32, 每个整数占4字节，并按照新的编码方式及元素个数扩容数组
+- 倒序依次将数组中的元素拷贝到扩容后的正确位置，如果从头开始移动元素的话，每次都要移动整个集合，而倒序就不需要了
+- 将待添加的元素放入数组末尾
+- 最后，将 inset 的 encoding 属性改为 INTSET_ENC_INT32，将 length 属性改为 4
+
+插入方法：
+
+```c
+intset *intsetAdd(intset *is, int64_t value, uint8_t *success) {
+    // 获取新元素适用的编码
+    uint8_t valenc = _intsetValueEncoding(value);
+    // 声明要插入的位置
+    uint32_t pos;
+    if (success) *success = 1;
+    // 判断编码是否超过了当前 intset 的编码
+    if (valenc > intrev32ifbe(is->encoding)) {
+        // 超出则进行升级
+        return intsetUpgradeAndAdd(is,value);
+    } else {
+        // 在当前 intset 中查找值与 value 一致的元素的角标
+        if (intsetSearch(is,value,&pos)) {
+            // 如果找到了则无需插入，返回 0 代表插入失败
+            if (success) *success = 0;
+            return is;
+        }
+        // 数组扩容操作，只是增加 contents 容量，原数据不动
+        is = intsetResize(is,intrev32ifbe(is->length)+1);
+        // 若插入位置不是数组末尾，则移动数组中 pos 之后的元素到 pos + 1，给新元素腾出空间
+        if (pos < intrev32ifbe(is->length)) intsetMoveTail(is,pos,pos+1);
+    }
+    // 插入新元素
+    _intsetSet(is,pos,value);
+    // 重置元素长度
+    is->length = intrev32ifbe(intrev32ifbe(is->length)+1);
+    return is;
+}
+```
+
+编码升级：
+
+```c
+static intset *intsetUpgradeAndAdd(intset *is, int64_t value) {
+    // 获取当前 intset 的编码
+    uint8_t curenc = intrev32ifbe(is->encoding);
+    // 获取新编码
+    uint8_t newenc = _intsetValueEncoding(value);
+    // 获取元素个数
+    int length = intrev32ifbe(is->length);
+    // 判断新元素整数负数，负数设置为 1，正数设置为 0
+    int prepend = value < 0 ? 1 : 0;
+    // 重置编码
+    is->encoding = intrev32ifbe(newenc);
+    // 重置数组大小
+    is = intsetResize(is,intrev32ifbe(is->length)+1);
+    // 倒序遍历，逐个搬运元素到新的位置，_intsetGetEncoded 方法则是按照就编码的方式查找旧元素
+    while(length--)
+        _intsetSet(is,length+prepend,_intsetGetEncoded(is,length,curenc));
+    // 插入新元素，1 就插数组首位
+    if (prepend)
+        _intsetSet(is,0,value);
+    // 0 就插数组尾部
+    else
+        _intsetSet(is,intrev32ifbe(is->length),value);
+    // 修改数组长度
+    is->length = intrev32ifbe(intrev32ifbe(is->length)+1);
+    return is;
+}
+```
+
+****
 
 
 
