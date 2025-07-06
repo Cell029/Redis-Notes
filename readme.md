@@ -5445,12 +5445,18 @@ http {
 ```shell
 # 启动 nginx（绝对路径启动）
 sudo /usr/local/openresty/nginx/sbin/nginx
-# 配置软连接后直接使用即可（sudo nginx、sudo nginx -s reload、nginx -s stop）
+# 配置软连接后直接使用即可（sudo nginx、sudo nginx -s reload、sudo nginx -s stop）
 sudo ln -s /usr/local/openresty/nginx/sbin/nginx /usr/local/bin/nginx
 # 重新加载配置
 sudo /usr/local/openresty/nginx/sbin/nginx -s reload
 # 停止
 sudo /usr/local/openresty/nginx/sbin/nginx -s stop
+```
+
+查看日志命令：
+
+```shell
+tail -f /usr/local/openresty/nginx/logs/error.log
 ```
 
 在浏览器输入 http://172.23.14.3:8081，看到 Welcome to OpenResty! 证明安装成功。
@@ -5859,6 +5865,1104 @@ location /item {
 ```
 
 ****
+#### 3.7 Redis 缓存预热
+
+缓存预热指的是在系统上线或重启后，提前将热点数据加载到 Redis 缓存中，避免系统冷启动时缓存为空，导致大量请求直接查询数据库，从而造成数据库压力骤增。
+
+使用步骤：
+
+1、利用 Docker 安装 Redis
+
+```shell
+docker run --name redis -p 6379:6379 -d redis redis-server --appendonly yes
+```
+
+启动前需要查看本地 Redis 是否占用了 6379 端口：
+
+```shell
+sudo lsof -i :6379
+# 显示 6379 被本地 Redis 占用
+COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+redis-ser 195 redis   20u  IPv4   5491      0t0  TCP *:redis (LISTEN)
+```
+
+如果只打算使用 Docker 的 Redis 就关掉本地的 Redis：
+
+```shell
+sudo systemctl stop redis
+```
+
+然后再次启动 Docker 的 Redis：
+
+```shell
+docker start redis
+```
+
+2、在项目中添加 Redis 依赖
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
+
+3、配置 Redis 地址
+
+```yaml
+spring:
+  data:
+    redis:
+      host: 172.23.14.3
+```
+
+4、编写初始化类
+
+缓存预热需要在项目启动时完成，并且必须是拿到 RedisTemplate 之后。这里利用 InitializingBean 接口来实现，因为 InitializingBean 可以在对象被 Spring 创建并且成员变量全部注入后开始执行。
+
+```java
+@Override
+public void afterPropertiesSet() throws Exception {
+    // 初始化缓存
+    // 1. 查询商品信息
+    List<Item> itemList = itemService.list();
+    // 2. 放入缓存
+    for (Item item : itemList) {
+        // item序列化为JSON
+        String json = MAPPER.writeValueAsString(item);
+        // 存入redis
+        redisTemplate.opsForValue().set("item:id:" + item.getId(), json);
+    }
+    // 3. 查询商品库存信息
+    List<ItemStock> stockList = stockService.list();
+    // 4. 放入缓存
+    for (ItemStock stock : stockList) {
+        // item序列化为JSON
+        String json = MAPPER.writeValueAsString(stock);
+        // 存入redis
+        redisTemplate.opsForValue().set("item:stock:id:" + stock.getId(), json);
+    }
+}
+```
+
+因为测试中的商品用例较少，所以直接把所有数据都放进缓存中，将来再次访问时可以直接通过 Redis 获取。当然每次启动 SpringBoot 都会导致重新向 Redis 中写一份数据，
+这就造成启动时压力较大，可以通过添加判断来决定哪些写入哪些不写入：
+
+```java
+// 只有在该 key 不存在时才写入
+Boolean result = redisTemplate.opsForValue().setIfAbsent("item:id:", json);
+```
+
+****
+#### 3.8 查询 Redis 缓存
+
+因为之前设置的是 Java 内置的缓存 Caffeine，所以 OpenResty 查询的缓存是没用到 Redis 的，现在就可以让 OpenResty 优先查询 Redis 缓存，如果未命中再查询 Tomcat。
+而 OpenResty 提供了操作 Redis 的模块，只要引入该模块就能直接使用，将 Redis 操作封装到之前的 common.lua 工具库中就可以快速使用。
+
+1、修改 /usr/local/openresty/lualib/common.lua 文件，引入 Redis 模块，并初始化 Redis 对象：
+
+```nginx
+-- 导入redis
+local redis = require('resty.redis')
+-- 初始化redis
+local red = redis:new()
+red:set_timeouts(1000, 1000, 1000) -- 连接、发送、接收超时时间，单位毫秒
+```
+
+2、封装函数，用来释放 Redis 连接，其实是放入连接池：
+
+```nginx
+-- 关闭redis连接的工具方法，其实是放入连接池
+local function close_redis(red)
+    local pool_max_idle_time = 10000 -- 连接的空闲时间，单位是毫秒
+    local pool_size = 100 --连接池大小
+    local ok, err = red:set_keepalive(pool_max_idle_time, pool_size)
+    if not ok then
+        ngx.log(ngx.ERR, "放入redis连接池失败: ", err)
+    end
+end
+```
+
+3、封装函数，根据 key 查询 Redis 数据：
+
+```nginx
+-- 查询redis的方法 ip和port是redis地址，key是查询的key
+local function read_redis(ip, port, key)
+    -- 获取一个连接
+    local ok, err = red:connect(ip, port)
+    if not ok then
+        ngx.log(ngx.ERR, "连接redis失败 : ", err)
+        return nil
+    end
+    -- 查询redis
+    local resp, err = red:get(key)
+    -- 查询失败处理
+    if not resp then
+        ngx.log(ngx.ERR, "查询Redis失败: ", err, ", key = " , key)
+    end
+    --得到的数据为空处理
+    if resp == ngx.null then
+        resp = nil
+        ngx.log(ngx.ERR, "查询Redis数据为空, key = ", key)
+    end
+    close_redis(red)
+    return resp
+end
+```
+
+4、导出
+
+```nginx
+-- 将方法导出
+local _M = {  
+    read_http = read_http,
+    -- 添加新的函数
+    read_redis = read_redis
+}  
+return _M
+```
+
+5、修改 /usr/local/openresty/nginx/item.lua 文件，添加一个查询函数：
+
+```nginx
+local read_redis = common.read_redis
+-- 封装查询函数
+function read_data(key, path, params)
+    -- 查询本地缓存
+    local val = read_redis("172.23.14.3", 6379, key)
+    -- 判断查询结果
+    if not val then
+        ngx.log(ngx.ERR, "redis查询失败，尝试查询http， key: ", key)
+        -- redis查询失败，去查询http
+        val = read_http(path, params)
+    end
+    -- 返回数据
+    return val
+end
+```
+
+6、修改商品查询、库存查询的业务，使用新封装好的查询函数：
+
+```nginx
+-- 查询商品信息
+local itemJSON = read_data("item:id:" .. id,  "/item/" .. id, nil)
+-- 查询库存信息
+local stockJSON = read_data("item:stock:id:" .. id, "/item/stock/" .. id, nil)
+```
+
+将上述文件全部更改后，测试项目，先让所有数据存入 Redis，然后关闭 SpringBoot 再刷新页面，看能否查到数据，如果能则配置成功。
+
+****
+#### 3.9 Nginx 本地缓存
+
+在前面的配置中，已经完成了 JVM 进程缓存的配置（Caffeine）和 Redis 缓存的配置，而整个缓存的查询流程是先查询 OpenResty 本地缓存，再查 Redis，最后是进程缓存，
+而 OpenResty 为 Nginx 提供了 shard dict 的功能，可以在 nginx 的多个 worker 之间共享数据，实现缓存功能。
+
+1、开启共享字典，在 /usr/local/openresty/nginx/conf/nginx.conf 的 http 下添加配置：
+
+```nginx
+# 共享字典，也就是本地缓存，名称叫做：item_cache，大小150m
+lua_shared_dict item_cache 150m; 
+ ```
+
+2、修改 /usr/local/openresty/lua/item.lua 文件，修改 read_data 查询函数，添加本地缓存逻辑：
+
+```nginx
+-- 导入共享词典，本地缓存
+local item_cache = ngx.shared.item_cache
+
+-- 封装查询函数
+function read_data(key, expire, path, params)
+    -- 查询本地缓存
+    local val = item_cache:get(key)
+    if not val then
+        ngx.log(ngx.ERR, "本地缓存查询失败，尝试查询Redis， key: ", key)
+        -- 查询redis
+        val = read_redis("127.0.0.1", 6379, key)
+        -- 判断查询结果
+        if not val then
+            ngx.log(ngx.ERR, "redis查询失败，尝试查询http， key: ", key)
+            -- redis查询失败，去查询http
+            val = read_http(path, params)
+        end
+    end
+    -- 查询成功，把数据写入本地缓存
+    item_cache:set(key, val, expire)
+    -- 返回数据
+    return val
+end
+```
+
+3、修改 item.lua 中查询商品和库存的业务，实现最新的 read_data 函数：
+
+```nginx
+-- 查询商品信息
+local itemJSON = read_data("item:id:" .. id, 1800,  "/item/" .. id, nil) -- 设置缓存时间，1800 s 后过期，自动删除
+-- 查询库存信息
+local stockJSON = read_data("item:stock:id:" .. id, 60, "/item/stock/" .. id, nil)
+```
+
+测试：
+
+输入 tail -f /usr/local/openresty/nginx/logs/error.log 打开日志，打开 SpringBoot 输入 URL，第一次查询某个商品时日志会打印：
+
+```text
+本地缓存查询失败，尝试查询Redis， key: item:id:10004, client: 127.0.0.1, server: localhost, request: "GET /api/item/10004 HTTP/1.1", host: "localhost"
+```
+
+第二次访问该 URL 时，则不会打印错误信息，证明配置成功。
+
+****
+### 4. 缓存同步
+
+缓存数据类似于数据库数据的副本，它可以加速读操作，但写操作仍需保证数据库是最终数据源。所以缓存与数据库写入时序不同步，
+可能导致缓存数据和数据库数据不一致，不一致会造成读脏数据、数据丢失、业务逻辑错误，严重时会带来数据安全风险。而大多数情况下，浏览器查询到的都是缓存数据，
+如果缓存数据与数据库数据存在较大差异，可能会产生比较严重的后果。而常见的数据同步策略有三种：
+
+1、设置有效期：给缓存设置有效期，到期后自动删除，再次查询时再更新
+
+- 优势：简单、方便
+- 缺点：时效性差，缓存过期之前可能不一致
+- 场景：更新频率较低，时效性要求低的业务
+
+2、同步双写：在修改数据库的同时，直接修改缓存
+
+- 优势：时效性强，缓存与数据库强一致
+- 缺点：有代码侵入，耦合度高；
+- 场景：对一致性、时效性要求较高的缓存数据
+
+3、异步通知：修改数据库时发送事件通知，相关服务监听到通知后修改缓存数据
+
+- 优势：低耦合，可以同时通知多个缓存服务
+- 缺点：时效性一般，可能存在中间不一致状态
+- 场景：时效性要求一般，有多个服务需要同步
+
+而异步实现又可以基于 MQ 或者 Canal 来实现：
+
+1、基于 MQ 的异步通知：
+
+- 数据修改阶段：商品服务(ItemService)接收到商品数据修改请求，先将数据写入MySQL数据库，然后再向消息队列(MQ)发送一条变更通知消息（包含商品ID等关键信息）
+- 缓存更新阶段：缓存服务作为 MQ 的消费者，它需要监听并接收到商品变更消息，然后根据消息内容查询最新数据并更新 Redis 缓存
+
+虽然这种方式可以让商品服务无需关心缓存实现，只需在意发布事件，以此达到解耦合的效果，但依然可能存在数据不一致的问题（因为各种问题可能造成更新延迟）。
+
+2、基于 Canal 的通知：
+
+- 数据修改阶段：商品服务正常执行数据库操作
+- Canal 监控到 MySQL 发生变化，立即通知缓存服务；缓存服务接收到 Canal 通知，更新缓存
+
+#### 4.1 Canal
+
+MySQL 主从同步机制：
+
+- 1）MySQL master 将数据变更写入二进制日志（binary log），其中记录的数据叫做 binary log events
+- 2）MySQL slave 将 master 的 binary log events 拷贝到它的中继日志(relay log)
+- 3）MySQL slave 重放 relay log 中事件，将数据变更反映它自己的数据
+
+而 Canal 就是把自己伪装成 MySQL 的一个 slave 节点，从而监听 master 的 binary log 变化，然后再把得到的变化信息通知给 Canal 的客户端，进而完成对其它数据库的同步。
+
+Canal 的安装：
+
+Canal 是基于 MySQL 的主从同步功能，因此必须先开启 MySQL 的主从功能才可以：
+
+1、开启 binlog
+
+打开 mysql 容器挂载的日志文件，在 /tmp/mysql/conf 目录:
+
+```shell
+sudo vi /tmp/mysql/conf/my.cnf
+
+[mysqld]
+skip-name-resolve
+character_set_server=utf8
+datadir=/var/lib/mysql
+server-id=1000
+log-bin=/var/lib/mysql/mysql-bin
+binlog-do-db=redis
+```
+
+2、设置用户权限
+
+添加一个仅用于数据同步的账户，出于安全考虑，这里仅提供对 redis 这个库的操作权限
+
+```sql
+create user canal@'%' IDENTIFIED by 'canal';
+GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT,SUPER ON *.* TO 'canal'@'%';
+FLUSH PRIVILEGES;
+      
+ALTER USER 'canal'@'%' IDENTIFIED BY 'canal_password';
+GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'canal'@'%';
+FLUSH PRIVILEGES;
+```
+
+3、重启 MySQL 并查看设置是否成功
+
+```shell
+docker restart mysql
+```
+
+```sql
+show master status;
+```
+
+文件名就是刚刚设置的 log-bin=/var/lib/mysql/mysql-bin，Position 就类似于 Redis 的 offset 偏移量，用来记录从文件与主文件的数据差值
+
+| File            | Position | Binlog_Do_DB | Binlog_Ignore_DB | Executed_Gtid_Set |
+|-----------------|----------|--------------|------------------|-------------------|
+| mysql - bin.000001 | 476      | redis        |                  |                   |
+
+
+安装 Canal：
+
+1、创建网络，将 MySQL、Canal、MQ 放到同一个 Docker 网络中
+
+```shell
+docker network create cell
+
+3e59daf994303a4776178bc382f91c7d280ce9af21e812d360023b15e78b092c
+```
+
+让 mysql 加入这个网络：
+
+```shell
+docker network connect cell mysql
+```
+
+2、拉取 canal 镜像
+
+```shell
+# 拉取最新稳定版
+docker pull canal/canal-server:latest
+```
+
+3、运行命令创建 Canal 容器
+
+```shell
+docker run -p 11111:11111 --name canal \
+-e canal.destinations=cell \
+-e canal.instance.master.address=mysql:3306  \
+-e canal.instance.dbUsername=canal  \
+-e canal.instance.dbPassword=canal  \
+-e canal.instance.connectionCharset=UTF-8 \
+-e canal.instance.tsdb.enable=true \
+-e canal.instance.gtidon=false  \
+-e canal.instance.filter.regex=redis\\..* \
+--network cell \
+canal/canal-server:latest
+```
+
+- docker run -p 11111:11111 --name canal \：Canal 默认监听端口是11111，客户端要通过这个端口连接 Canal，给容器命名为 canal
+- -e canal.destinations=cell \：定义 Canal 监听的实例名，叫 cell
+- -e canal.instance.master.address=mysql:3306  \：指定 Canal 监听的 MySQL 主库地址，这里 mysql 是 MySQL 容器的名称或主机名，端口是 3306。果不知道 mysql 容器地址，可以通过 docker inspect 容器id 来查看
+- -e canal.instance.dbUsername=canal：数据库用户名
+- -e canal.instance.dbPassword=canal：数据库密码
+- -e canal.instance.filter.regex=：要监听的表名称
+- --network cell \：指定容器加入名为 cell 的 Docker 网络
+
+```shell
+docker logs -f canal
+# 查看是否安装成功
+DOCKER_DEPLOY_TYPE=VM
+==> INIT /alidata/init/02init-sshd.sh
+==> EXIT CODE: 0
+==> INIT /alidata/init/fix-hosts.py
+==> EXIT CODE: 0
+==> INIT DEFAULT
+==> INIT DONE
+==> RUN /home/admin/app.sh
+==> START ...
+start canal ...
+start canal successful
+==> START SUCCESSFUL ...
+```
+
+4、查看日志
+
+```shell
+tail -f /home/admin/canal-server/logs/canal/canal.log
+```
+
+表名称监听支持的语法：
+
+```text
+mysql 数据解析关注的表，Perl 正则表达式.
+多个正则之间以逗号(,)分隔，转义符需要双斜杠(\\) 
+常见例子：
+1.  所有表：.*   or  .*\\..*
+2.  canal schema下所有表： canal\\..*
+3.  canal下的以canal打头的表：canal\\.canal.*
+4.  canal schema下的一张表：canal.test1
+5.  多个规则组合使用然后以逗号隔开：canal\\..*,mysql.test1,mysql.test2 
+```
+
+****
+#### 4.2 监听 Canal
+
+1、引入依赖
+
+```xml
+<dependency>
+    <groupId>top.javatool</groupId>
+    <artifactId>canal-spring-boot-starter</artifactId>
+    <version>1.2.1-RELEASE</version>
+</dependency>
+```
+
+2、编写配置
+
+```yaml
+canal:
+  destination: cell # canal的集群名字，要与安装canal时设置的名称一致，即与 destinations 一直
+  server: 172.23.14.3:11111 # canal服务地址
+```
+
+3、编写监听器
+
+通过实现 EntryHandler<T> 接口编写监听器，监听 Canal 消息，但需要注意两点：
+
+- 实现类通过 @CanalTable("tb_item") 指定监听的表信息
+- EntryHandler 的泛型是与表对应的实体类
+
+当 MySQL 中的数据发生改变时（增删改），就会触发以下三个方法，然后把新的数据存入redis与JVM缓存中
+
+```java
+@CanalTable("tb_item")
+@Component
+public class ItemHandler implements EntryHandler<Item> {
+
+    @Autowired
+    private RedisHandler redisHandler;
+    @Autowired
+    private Cache<Long, Item> itemCache;
+
+    @Override
+    public void insert(Item item) {
+        System.out.println("Insert event received: " + item);
+        // 写数据到JVM进程缓存
+        itemCache.put(item.getId(), item);
+        // 写数据到redis
+        redisHandler.saveItem(item);
+    }
+
+    @Override
+    public void update(Item before, Item after) {
+        System.out.println("Update event received: before=" + before + ", after=" + after);
+        // 写数据到JVM进程缓存
+        itemCache.put(after.getId(), after);
+        // 写数据到redis
+        redisHandler.saveItem(after);
+    }
+
+    @Override
+    public void delete(Item item) {
+        System.out.println("Delete event received: " + item);
+        // 删除数据到JVM进程缓存
+        itemCache.invalidate(item.getId());
+        // 删除数据到redis
+        redisHandler.deleteItemById(item.getId());
+    }
+}
+```
+
+****
+## 四. Redis 键值设计
+
+Redis 的 Key 虽然可以自定义，但最好遵循下面的几个最佳实践约定：
+
+- 遵循基本格式：[业务名称]:[数据名]:[id]
+- 长度不超过 44 字节
+- 不包含特殊字符
+
+例如登录业务，需要保存用户信息，其 key 可以设计成：login:user:1，这样设计的好处是可读性强，因为 redis 中没有 table 的概念，所以这样可以避免 key 冲突，
+并且更节省内存，key 是 string 类型，底层编码包含 int、embstr 和 raw三 种，embstr 在小于44 字节时使用，采用连续内存空间，内存占用更小。
+当字节数大于 44 字节时，会转为 raw 模式存储，在 raw 模式下，内存空间不是连续的，而是采用一个指针指向了另外一段内存空间，在这段空间里存储 SDS 内容，
+这样空间不连续，访问的时候性能也就会收到影响，还有可能产生内存碎片。
+
+```shell
+set num 123
+type num
+string
+object encoding num
+"int"
+
+set name Jack
+object encoding name
+"embstr"
+
+set name aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+OK
+object encoding name
+"raw"
+```
+
+### 1. BigKey
+
+BigKey 通常以 Key 的大小和 Key 中成员的数量来综合判定，例如：
+
+- String 类型：Value 体积超大，如存储大文件内容
+- Hash 类型：成员数量虽少，但单个 Value 数据超大
+- ZSet / List / Set：成员数量巨大，单次操作时 Redis 需处理大量数据
+
+BigKey 的危害:
+
+网络阻塞：
+- Redis 是单线程，虽然性能高，但一次性传输较高容量的数据，容易导致带宽使用率被占满
+
+数据倾斜：
+- BigKey 所在的 Redis 实例内存使用率远超其他实例，就会导致无法使数据分片的内存资源达到均衡
+
+Redis阻塞：
+- 对元素较多的 hash、list、zset 等做运算会耗时较旧，使主线程被阻塞
+
+CPU压力：
+- 对 BigKey 的数据序列化和反序列化会导致 CPU 的使用率飙升，影响 Redis 实例和本机其它应用
+
+如何排查 BigKey：
+
+1、利用 redis-cli 提供的 --bigkeys 参数，可以遍历分析所有 key，并返回 Key 的整体统计信息与每个数据的 Top1 的 big key
+
+```shell
+redis-cli --bigkeys
+
+100.00% ||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+Keys sampled: 15
+
+-------- summary -------
+
+Total key length in bytes is 193 (avg len 12.87)
+
+Biggest string found "item:id:10004" has 467 bytes
+
+0 lists with 0 items (00.00% of keys, avg size 0.00)
+0 hashs with 0 fields (00.00% of keys, avg size 0.00)
+0 streams with 0 entries (00.00% of keys, avg size 0.00)
+15 strings with 2962 bytes (100.00% of keys, avg size 197.47)
+0 sets with 0 members (00.00% of keys, avg size 0.00)
+0 zsets with 0 members (00.00% of keys, avg size 0.00)
+```
+
+2、scan 扫描
+
+手动编程，利用 scan 扫描 Redis 中的所有 key，利用 strlen、hlen 等命令判断 key 的长度（不建议使用MEMORY USAGE），
+scan 命令调用完后每次会返回 2 个元素，第一个是下一次迭代的光标，第一次光标会设置为 0，当最后一次 scan 返回的光标等于 0 时，
+表示整个 scan 遍历结束了，第二个返回的是 List，一个匹配的 key 的数组
+
+```java
+private Jedis jedis;
+@BeforeEach
+void setUp() {
+    // 1. 建立连接
+    jedis = new Jedis("172.23.14.3", 6379);
+    // 2. 设置密码
+    jedis.auth("123");
+    // 3. 选择库
+    jedis.select(0);
+}
+// 定义 BigKey 的阈值
+final static int STR_MAX_LEN = 10 * 1024;
+// 其他结构超过 500 个元素视为 BigKey
+final static int HASH_MAX_LEN = 500;
+@Test
+void testScan() {
+    int maxLen = 0;
+    long len = 0;
+    String cursor = "0";
+    do {
+        // 扫描并获取一部分key
+        ScanResult<String> result = jedis.scan(cursor);
+        // 记录cursor
+        cursor = result.getCursor();
+        List<String> list = result.getResult();
+        if (list == null || list.isEmpty()) {
+            break;
+        }
+        // 遍历
+        for (String key : list) {
+            // 判断key的类型
+            String type = jedis.type(key);
+            switch (type) {
+                case "string":
+                    len = jedis.strlen(key);
+                    maxLen = STR_MAX_LEN;
+                    break;
+                case "hash":
+                    len = jedis.hlen(key);
+                    maxLen = HASH_MAX_LEN;
+                    break;
+                case "list":
+                    len = jedis.llen(key);
+                    maxLen = HASH_MAX_LEN;
+                    break;
+                case "set":
+                    len = jedis.scard(key);
+                    maxLen = HASH_MAX_LEN;
+                    break;
+                case "zset":
+                    len = jedis.zcard(key);
+                    maxLen = HASH_MAX_LEN;
+                    break;
+                default:
+                    break;
+            }
+            if (len >= maxLen) {
+                System.out.printf("Found big key : %s, type: %s, length or size: %d %n", key, type, len);
+            }
+        }
+    } while (!cursor.equals("0"));
+}
+@AfterEach
+void tearDown() {
+    if (jedis != null) {
+        jedis.close();
+    }
+}
+```
+
+在 Redis 中插入一条长度大于 10240 的数据，然后通过这个代码获取：
+
+```text
+Found big key : big:string, type: string, length or size: 11000 
+```
+
+BigKey 的删除：
+
+因为 BigKey 内存占用较多，删除这样的 key 需要耗费很长时间，若直接释放大块内存或大量子元素，这就会导致 Redis 主线程阻塞，引发一系列问题。在 Redis 3.0 及以下版本，
+如果是集合类型，则遍历 BigKey 的元素，先逐个删除子元素，最后删除 BigKey：
+
+```shell
+# 如果是集合类型，就逐个释放每个子元素
+DEL bigkey
+```
+
+Redis 4.0 以后，使用异步删除 UNLINK 命令，它会立即将 key 从主字典中删除，但实际的内存释放是在后台由异步线程完成的：
+
+```shell
+# 返回 1 表示已标记删除，真正内存释放稍后在后台完成
+UNLINK bigkey
+```
+
+****
+### 2. 恰当的数据类型
+
+存储一个 User 对象，通常有三种方法：
+
+1、Json 字符串
+
+|   key    |       value                  |
+|:--------:|:----------------------------:|
+| user:1   | {"name": "Jack", "age": 21}  |
+
+- 优点：实现简单粗暴，可以同时获取全部信息
+- 缺点：数据耦合，不够灵活，修改数据时较为麻烦
+
+2、每个字段拆成独立的 key-value
+
+|  key        | value |
+|:-----------:|:-----:|
+| user:1:name | Jack  |
+| user:1:age  |  21   |
+
+- 优点：可以灵活访问对象任意字段 
+- 缺点：占用空间大、没办法做统一控制
+
+Redis 每个 Key 都有自己的元数据（内部结构体等），这部分内存开销是固定的开销，段打散后，user:1:name 和 user:1:age 等多个 Key，
+它们每个 Key 都需要存储完整的前缀（如 user:1:），这就会导致导致重复存储，且每个 Key 的元信息都占用空间，这就导致元信息大量无效重复
+
+3、Hash 结构
+
+|  key   | field | value |
+|:------:|------:|:-----:|
+| user:1 |  name | jack  |
+|        |   age |  21   |
+
+- 优点：底层使用 ziplist，空间占用小，可以灵活访问对象的任意字段 
+- 缺点：代码相对复杂
+
+Redis 中的 Hash 类似于 Java 的 Map<String, String> 结构，当数据较小时，底层使用 ziplist（压缩列表，内存连续分配，类似数组）优化存储，以此减少内存碎片，比单独拆散成多个 Key 节省空间，还可以通过配置 redis.conf 参数控制结构：
+
+```redis
+hash-max-ziplist-entries 512  # 最大字段数
+hash-max-ziplist-value 64 # 最大 value 字节数
+```
+
+超过这个范围，底层结构自动切换为 hashtable 存储（每个元素占用独立内存块，通过哈希函数定位数据位置）。
+
+假如有 hash 类型的 key，其中有 100 万对 field 和 value，field 是自增 id，这个 key 存在什么问题？如何优化？
+
+存在的问题：当 hash 的 entry 数量超过 500 时，会使用哈希表而不是 ZipList，这就会导致内存占用较多，然后变成一个 bigkey。所以可以把这一整个 hash 结构拆分为多个 hash 结构，
+例如将 id / 100 作为 key， 将 id % 100 作为 field，这样每 100个 元素为一个 hash，
+
+|   key    | field |    value    |
+|:--------:|------:|:-----------:|
+|  key:0   | id:00 |   value0    |
+|          | ..... |    .....    |
+|          | id:99 |   value99   |
+|  key:1   | id:00 |  value100   |
+|          | ..... |    .....    |
+|          | id:99 |  value199   |
+|   ...    |   ... |     ...     |
+| key:9999 | id:00 | value999900 |
+|          |   ... |     ...     |
+|          | id:99 | value999999 |
+
+将大 hash 变成多个小 hash，保证每个 hash 底层使用的都是 ziplist 结构。
+
+****
+### 3. 批处理优化
+
+Redis 提供了很多 Mxxx 这样的命令，可以实现批量插入数据，例如：
+
+- MSET:批量设置多个字符串键值，让多个 key-value 一次写入，该操作具有原子性
+- MGET：批量获取多个字符串键值
+- HMSET：批量设置 Hash 的多个字段，但现在推荐使用 HSET
+- HSET：支持批量设置 Hash 字段，新版 HSET 支持多字段一次性插入
+
+客户端与 Redis 服务端的一次命令响应时间 = 1 次往返的网络传输耗时 + 1 次 Redis 执行命令耗时，而这里面主要耗时的就是网络传输，Redis 处理指令很快，
+所以一次只传输一条指令的话就很浪费时间，如果一次传输多条数据就可以减少网络传输的次数。
+
+```java
+@Test
+void testMxx() {
+    String[] arr = new String[2000];
+    int j;
+    long b = System.currentTimeMillis();
+    for (int i = 1; i <= 100000; i++) {
+        // 每 1000 次循环执行一次批量操作
+        j = (i % 1000) << 1; // (i % 1000) * 2，得到 0 - 999 然后获取偶数
+        arr[j] = "test:key_" + i;
+        arr[j + 1] = "value_" + i;
+        if (j == 0) {
+            jedis.mset(arr);
+        }
+    }
+    long e = System.currentTimeMillis();
+    System.out.println("time: " + (e - b));
+}
+```
+
+虽然以上操作可以减少耗时，但仍然存在局限性，因为它们本质上是针对同一种数据结构的一次性多数据操作，并不能跨数据类型混用，例如 MSET 只操作字符串，
+HSET 只操作 Hash，SADD 只操作 Set。因此，如果有对复杂数据类型的批处理需要，建议使用 Pipeline。
+
+Pipeline 是 Redis 提供的一种客户端批量发送命令的机制，但它发送的每条命令独立，不具备原子性
+
+```java
+Pipeline pipeline = jedis.pipelined();
+
+pipeline.set("key1", "value1");
+pipeline.hset("user:1", "name", "jack");
+pipeline.sadd("set1", "a", "b", "c");
+pipeline.zadd("zset1", 1, "score1");
+pipeline.zadd("zset1", 2, "score2");
+
+pipeline.sync();
+jedis.close();
+```
+
+集群下的批处理：
+
+如 MSET 或 Pipeline 这样的批处理需要在一次请求中携带多条命令，而如果此时 Redis 是一个集群，那批处理命令的多个 key 就必须落在同一个插槽中，如果这些 Key 映射到了不同槽位，Redis 集群就无法确保所有 Key 在同一节点，就会导致执行失败。
+
+解决方案：
+
+1、串行执行，依次执行每个命令，虽然耗时效率低，但不会导致上述问题。
+
+2、使用串行 slot，简单来说，就是执行前让客户端先计算一下对应的 key 的 slot，一样 slot 的 key 就放到一个组里边，然后对每个组执行 pipeline 的批处理，
+它就能串行执行各个组的命令，这种做法比第一种方法耗时要少，但是相对来说执行较为复杂一点
+
+3、使用并行 slot，相较于第二种方案，在分组完成后串行执行，该方法就变成了并行执行各个命令，所以他的耗时就非常短，但是实现更加复杂。
+
+4、使用 hash_tag，redis 计算 key 的 slot 的时候，其实是根据 key 的有效部分来计算的，通过这种方式就能一次处理所有的 key，这种方式耗时最短，实现也简单，
+但是如果通过操作 key 的有效部分，那么就会导致所有的 key 可能都落在一个节点上，产生数据倾斜的问题
+
+例如串行 slot 方案：
+
+```java
+void testMSet2() {
+    Map<String, String> map = new HashMap<>(3);
+    map.put("name", "Jack");
+    map.put("age", "21");
+    map.put("sex", "Male");
+    // 对 Map 数据进行分组。根据相同的slot放在一个分组
+    // key 就是 slot，value 就是一个组
+    Map<Integer, List<Map.Entry<String, String>>> result = map.entrySet()
+            .stream()
+            .collect(Collectors.groupingBy(
+                    // 将 map 中的所有 entry 计算出它们的 key 对应的 slot，然后根据这个 slot 作为新的 key
+                    entry -> ClusterSlotHashUtil.calculateSlot(entry.getKey()))
+            );
+    // 串行的去执行 mset 的逻辑， value 是 List<Map.Entry<String, String>>
+    for (List<Map.Entry<String, String>> list : result.values()) {
+        String[] arr = new String[list.size() * 2];
+        for (int i = 0; i < list.size(); i++) {
+            Map.Entry<String, String> e = list.get(i);
+            arr[i * 2] = e.getKey();
+            arr[i * 2 + 1] = e.getValue();
+        }
+        jedisCluster.mset(arr);
+    }
+}
+```
+
+Spring 集群环境下批处理代码就不会产生出现在不同 slot 的情况，
+
+```java
+void testMSetInCluster() {
+    Map<String, String> map = new HashMap<>(3);
+    map.put("name", "Rose");
+    map.put("age", "21");
+    map.put("sex", "Female");
+    stringRedisTemplate.opsForValue().multiSet(map);
+
+    List<String> strings = stringRedisTemplate.opsForValue().multiGet(Arrays.asList("name", "age", "sex"));
+    if (strings != null) {
+        strings.forEach(System.out::println);
+    }
+}
+```
+
+multiSet 底层调用 Lettuce（异步Redis客户端），通过 Lettuce 的异步命令接口调用 mset，然后同步获取结（这里依然是单节点执行的命令）
+
+```java
+public Boolean mSet(Map<byte[], byte[]> tuples) {
+    Assert.notNull(tuples, "Tuples must not be null");
+    return (Boolean)this.connection.invoke().from(RedisStringAsyncCommands::mset, tuples).get(Converters.stringToBooleanConverter());
+}
+```
+
+这是集群环境下重写的 mset 方法，调用 SlotHash.partition，把所有 key 按照 Redis 集群的 slot 拆分成多个组，然后对每个分组执行父类的单节点的 mset，
+
+```java
+public RedisFuture<String> mset(Map<K, V> map) {
+    Map<Integer, List<K>> partitioned = SlotHash.partition(this.codec, map.keySet());
+    // 如果所有 key 都落在同一 slot，直接调用单节点的 mset 方法
+    if (partitioned.size() < 2) {
+        return super.mset(map);
+    } else {
+        Map<Integer, RedisFuture<String>> executions = new HashMap();
+        for(Map.Entry<Integer, List<K>> entry : partitioned.entrySet()) {
+            Map<K, V> op = new HashMap();
+            ((List)entry.getValue()).forEach((k) -> op.put(k, map.get(k)));
+            RedisFuture<String> mset = super.mset(op);
+            executions.put(entry.getKey(), mset);
+        }
+        return MultiNodeExecution.firstOfAsync(executions);
+    }
+}
+```
+
+****
+### 4. 服务器端优化
+
+#### 4.1 持久化配置
+
+Redis 的持久化虽然可以保证数据安全，但也会带来很多额外的开销，例如：需要大量内存配合 fork 子进程，rewrite（日志重写）期间有额外CPU、磁盘压力等，因此持久化请遵循下列建议：
+
+* 用来做缓存的 Redis 实例尽量不要开启持久化功能
+
+如果是纯粹做缓存（热点数据、短期临时数据）这种本身要求高性能、低延迟的操作，并且这些数据通常可以丢弃（可以通过数据库重建），如果对这些数据开启持久化，
+就会消耗 CPU、内存和磁盘资源，与缓存追求的高性能目标冲突。
+
+* 建议关闭 RDB 持久化功能，使用 AOF 持久化
+
+RDB 快照在生成过程中需要 fork 子进程，虽然恢复速度较快，但整体内存消耗较高，而 AOF 通过牺牲磁盘的空间来解决占用较多内存的问题，并且数据丢失的风险更低。
+
+* 利用脚本定期在 slave 节点做 RDB，实现数据备份（redis-cli bgsave）
+
+如果主节点压力较大，并且数据较为重要，就应该避免使用 RDB 造成堵塞，让数据备份操作由 slave 进行，master 专注于读写操作。
+
+* 设置合理的 rewrite 阈值，避免频繁的 bgrewrite
+* 配置 no-appendfsync-on-rewrite = yes，禁止在 rewrite 期间做 aof，避免因 AOF 竞争导致的主线程阻塞
+
+部署有关建议：
+- Redis 实例的物理机要预留足够内存，应对 fork 和 rewrite
+- 单个 Redis 实例内存上限不要太大，例如 4G 或 8G。避免大内存实例的 fork 操作，以加快 fork 的速度、减少主从同步、数据迁移压力
+- 因为 Redis 是单线程模型，CPU 利用率直接影响请求处理能力，所以不要与 CPU 密集型应用部署在一起
+- 数据库的随机 IO 与 Redis 的顺序 IO 模式冲突，而消息队列的批量写入会抢占磁盘带宽，所以尽量不要与它们一起部署
+
+****
+#### 4.2 慢查询优化
+
+凡是在 Redis 内部执行时间超过设定阈值的命令，都视为慢查询，即便只是查一个很小的 key，如果 Redis 内部逻辑复杂、数据结构膨胀，也可能触发慢查询。
+由于 Redis 是单线程的，所以当客户端发出指令后，它们都会进入到同一个队列中，如果此时有一些慢查询的数据，就会导致大量请求阻塞，从而引起报错。
+
+常见慢查询：
+
+- 大键查询（get bigkey）
+- 复杂聚合操作，如执行 SORT
+- 正则匹配查询，可能会全库扫描键空间，阻塞主线程
+- 滥用全盘扫描
+- AOF 刷盘阻塞导致命令处理延迟
+
+慢查询会被放入慢查询日志中，日志的长度有上限，可以通过配置指定：
+
+```redis
+# 默认值
+slowlog-log-slower-than:10000 # 阈值(微秒)
+slowlog-max-len:128 # 日志最大长度
+slowlog-entries:5 # 当前日志条目数
+```
+
+通过 get 获取，通过 set 修改：
+
+```redis
+config get slowlog-log-slower-than
+1) "slowlog-log-slower-than"
+2) "10000"
+
+config get slowlog-max-len
+1) "slowlog-max-len"
+2) "128"
+```
+
+```redis
+config set slowlog-log-slower-than 1000
+OK
+config get slowlog-log-slower-than
+1) "slowlog-log-slower-than"
+2) "1000"
+```
+
+查看慢查询：
+
+* slowlog len：查询慢查询日志长度
+* slowlog get [n]：读取n条慢查询日志
+* slowlog reset：清空慢查询列表
+
+****
+#### 4.3 敏感命令及安全配置
+
+默认情况下 Redis 服务监听 0.0.0.0:6379，即所有公网 IP 可直接访问，如果 redis.conf 没有开启 requirepass 配置（设置密码），那么任意客户端无需身份认证即可操作 Redis。
+
+为了避免这样的漏洞，这里给出一些建议：
+
+* Redis 一定要设置密码
+* 禁止线上使用下面命令：keys、flushall、flushdb、config set 等命令，可以利用 rename-command 禁用。
+* bind：限制网卡，禁止外网网卡访问
+* 开启防火墙
+* 不要使用 Root 账户启动 Redis
+* 尽量不使用默认的端口
+
+****
+#### 4.4 内存配置
+
+当 Redis 内存不足时，可能导致 Key 频繁被删除、响应时间变长、QPS 不稳定等问题。当内存使用率达到 90% 以上时就需要警惕，并快速定位到内存占用的原因。
+
+Redis 内存三大核心组成：
+
+- 数据内存：存储所有 Key、Value 数据，是 Redis 内存占用的大头，重点关注 BigKey、碎片
+- 进程内存：Redis 运行本身的占用，包括代码区、常量区、堆栈，通常几 MB，可忽略不计
+- 缓冲区内存：Redis 读写过程中为保障性能设计的内存区域，波动大，需重点监控
+
+内存碎片：
+
+内存碎片指的是由于内存分配策略，导致系统分配的实际内存大于程序真正使用的内存，多出来的空间无法被有效利用，这部分浪费空间被称为内存碎片。
+Redis 默认使用 jemalloc 分配内存，jemalloc 并不会精准按需要的内存大小来分配，而是按照内存块粒度进行分配，例如申请 5 字节，实际分配 8 字节。
+
+```redis
+info memory
+# Memory
+used_memory:19068056
+used_memory_rss:37302272
+used_memory_rss_human:35.57M
+total_system_memory:8212672512
+maxmemory_policy:noeviction
+allocator_frag_ratio:1.02
+allocator_rss_ratio:1.21
+rss_overhead_ratio:1.53
+mem_fragmentation_ratio:1.96
+
+used_memory:         实际使用内存
+used_memory_rss:     操作系统分配的物理内存
+mem_fragmentation_ratio: 碎片率
+```
+
+当 ratio 超过 2 时证明此时内存严重浪费，需要进行调整。
+
+缓冲区内存：
+
+1、客户端缓冲区
+
+每个客户端连接 Redis 时，Redis 都会为该客户端分配输入、输出缓冲区，输入缓冲区负责存放客户端发送的命令请求；输出缓冲区负责存放 Redis 执行完命令后返回的结果。
+
+输出缓冲区的风险与原因：
+
+当客户端发送请求 GET big:string，因为 Redis 是单线程执行很快，5MB 数据会立即进入输出缓冲区，若客户端网络慢、消费慢，就会导致输出缓冲区无法及时释放，
+如果多个客户端同时执行类似操作，输出缓冲区总体暴涨，就会导致 Redis 宕机，数据丢失。
+
+默认情况下输出缓冲区是没设置大小的，这就会导致它无限增长：
+
+```redis
+CONFIG GET client-output-buffer-limit
+client-output-buffer-limit normal 0 0 0
+```
+
+可以设置它的软硬上限让它及时断开连接，避免 Redis 断连
+
+```redis
+client-output-buffer-limit <类别> <硬上限> <软上限> <软限制生效时间（秒）>
+client-output-buffer-limit normal 64mb 16mb 60 # 普通客户端
+client-output-buffer-limit pubsub 32mb 8mb 60 # 订阅/发布的客户端
+client-output-buffer-limit replica 256mb 64mb 60 # 主从同步客户端，从节点连接主节点
+```
+
+2、AOF 缓冲区
+
+AOF 持久化开启时，执行的写操作会先写入内存缓冲区，然后再批量进行刷盘操作，但无法设置大小，相关配置如下：
+
+```redis
+appendfsync always # 每次写操作立刻持久化，开销大
+appendfsync everysec # 每秒同步一次，常用，兼顾性能与数据安全
+appendfsync no # 由操作系统决定何时刷盘，效率高但数据不安全
+```
+
+3、复制缓冲区
+
+Redis 主从同步时，主机会维护一片复制缓冲区用来存放全量或增量数据，然后将这片缓冲区的内容发送给从节点，可以通过 replbacklog-size 来设置，默认 1mb。
+
+****
+#### 4.5 集群最佳实践
+
+集群虽然具备高可用特性，能实现自动故障恢复，但是如果使用不当，也会存在一些问题：
+
+1、在 Redis 的默认配置中，如果发现任意一个插槽不可用，则整个集群都会停止对外服务
+
+Redis 未保障数据完整性，防止访问不一致的数据问题，默认是开启该功能的，假如某节点宕机，导致部分 Slot 丢失，那么该集群整体都罢工， 这对于业务功能来讲是不合适的，
+它会严重导致效率低下，所以在一般不需要强一致性的情况下可以选择关闭，这样即使有部分插槽不能使用，但整体集群还是在工作中的。
+
+```redis
+cluster-require-full-coverage yes
+```
+
+2、集群带宽问题
+
+集群节点之间会不断的互相 Ping 来确定集群中其它节点的状态，而每次 Ping 携带的信息至少包括插槽信息和集群状态信息，当集群中节点越多，集群状态信息数据量也就越大，
+10 个节点的相关信息可能达到 1kb，当打击群频繁的通讯，此时每次集群互通需要的带宽会非常高，这样会导致集群中大量的带宽都会被占用，极端情况西可能导致 Redis 响应变慢。
+
+所以在使用时：
+
+- 避免超大型集群，官方建议集群节点总数不宜超过 1000，如果有超大规模业务，应该拆分成多个独立 Redis 集群，避免单集群过重
+- 不建议单机部署太多 Redis 实例，当多个 Redis 共用带宽时，必定会占用较多网络资源
+- 配置 cluster-node-timeout，当节点在指定时间内未接收到消息，则认为其处于宕机状态
+
+3、命令的集群兼容性问题
+
+当使用批处理的命令时，redis 要求处理中的所有 key 必须落在相同的 slot 上，当有大量的 key 同时操作时可能是无法完成的，所以客户端必须要对这样的数据进行处理。
+
+4、lua 和事务的问题
+
+Redis 是串行执行命令的，当一次性将多条命令发送到 Redis 时，Redis 只会保证命令的顺序性，不会保证原子性，即使部分命令失败，也不会回滚，这就是 Redis 的事务操作；
+而 lua 脚本是由 Redis 服务器执行的命令，它的存在让 Redis 的事务真正具备了原子性（Redis 执行脚本时不会执行其他命令，脚本要么完全执行成功，要么完全不执行）。
+对于集群来说，它是无法发挥事务的特性的，因为事务内只能操作同槽 key，否则 Redis 无法分发到正确节点统一处理，lua 脚本同理。
+
+大部分情况下单体 Redis（主从 Redis）已经能达到万级别的 QPS（1秒时间内能够成功处理的请求数量），并且也具备很强的高可用特性。
+如果在主从能满足业务需求的情况下，尽量不搭建 Redis 集群。
+
+****
+## 五. Redis 数据结构
+
+### 1. 动态字符串
+
+
 
 
 

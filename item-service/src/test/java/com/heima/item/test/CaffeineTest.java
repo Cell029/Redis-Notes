@@ -5,6 +5,10 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 public class CaffeineTest {
 
@@ -61,4 +65,6 @@ public class CaffeineTest {
         Thread.sleep(1200L);
         System.out.println("name: " + cache.getIfPresent("name"));
     }
+
+
 }

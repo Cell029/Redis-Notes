@@ -5,6 +5,10 @@ import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.Transient;
+
+import javax.persistence.Column;
 
 import java.util.Date;
 
@@ -12,7 +16,9 @@ import java.util.Date;
 @TableName("tb_item")
 public class Item {
     @TableId(type = IdType.AUTO)
+    @Id
     private Long id;//商品id
+    @Column(name = "name")
     private String name;//商品名称
     private String title;//商品标题
     private Long price;//价格（分）
@@ -24,7 +30,9 @@ public class Item {
     private Date createTime;//创建时间
     private Date updateTime;//更新时间
     @TableField(exist = false)
+    @Transient
     private Integer stock;
     @TableField(exist = false)
+    @Transient
     private Integer sold;
 }
