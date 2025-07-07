@@ -7059,7 +7059,6 @@ typedef struct intset {
 +------------------+--------+-------+-------+-------+
 | INTSET_ENC_INT16 |   3    |   1   |   3   |   5   |
 +------------------+--------+-------+-------+-------+
-  ()
 ```
 
 数组中每个数字都在 int16_t 的范围内，因此采用的编码方式是 INTSET_ENC_INT16，每部分占用的字节大小为：
@@ -7072,7 +7071,7 @@ contents 数组中存放的每个整数的大小都是一样的，因为这样�
 
 但当向其中添加一个数字 50000，这个数字就超过了 int16_t 的范围，此时 intset 就会自动升级编码方式到合适的大小：
 
-- 升级编码为INTSET_ENC_INT32, 每个整数占4字节，并按照新的编码方式及元素个数扩容数组
+- 升级编码为 INTSET_ENC_INT32, 每个整数占4字节，并按照新的编码方式及元素个数扩容数组
 - 倒序依次将数组中的元素拷贝到扩容后的正确位置，如果从头开始移动元素的话，每次都要移动整个集合，而倒序就不需要了
 - 将待添加的元素放入数组末尾
 - 最后，将 inset 的 encoding 属性改为 INTSET_ENC_INT32，将 length 属性改为 4
@@ -7142,9 +7141,753 @@ static intset *intsetUpgradeAndAdd(intset *is, int64_t value) {
 ```
 
 ****
+### 3. Dict
+
+Redis 是一个键值型（Key-Value）的数据库，可以根据 key 实现快速的增删改查，而键与值的映射关系正是通过 Dict 结构来实现的。Dict 由三部分组成，
+分别是：哈希表（DictHashTable）、哈希节点（DictEntry）、字典（Dict）。Redis 的 Set 类型会根据集合中的元素是否为整数来判断是否使用 Dict 结构，
+如果元素数量超过 set-max-intset-entries 配置（默认 512），也会自动转换。
+
+```c
+// 哈希表结构，实际的存储空间
+typedef struct dictht {
+    dictEntry **table; // 指向 dictEntry 指针数组，数组每个槽位是链表头指针
+    unsigned long size; // 哈希表的大小
+    unsigned long sizemask; // 哈希表大小的掩码，总等于 size - 1，用来快速计算
+    unsigned long used; // 实际存储的键值对数量
+} dictht;
+```
+
+union 是 C 语言的一种特殊结构，它可以内部多个成员互斥使用，同一时间只能使用其中一种类型，但可根据需要切换，因为 Redis 支持多样化数据结构，所以 value 的存储需求多变，
+存储字符串时就让 void* val 指向字符串，存放整数，就用 int64_t s64 直接存数字...具体存储什么类型，需配合 dict 结构中的 dictType 的操作函数决定。
+
+```c
+// 哈希节点，存储每个键值对
+typedef struct dictEntry {
+    void *key; // 键指针
+    union {
+        void *val; // 值指针
+        uint64_t u64; // 64位无符号整数
+        int64_t s64; // 64位有符号整数
+        double d; // 双精度浮点数
+    } v;
+    struct dictEntry *next; // 指向下一个节点，形成链表
+} dictEntry;
+```
+
+向 Dict 添加键值对时，Redis 首先根据 key 计算出 hash 值（h），然后利用 h & sizemask 来计算元素应该存储到数组中的哪个索引位置。而 dictht 中的 size 大小始终为 2^n，
+与 Java 的 Hash 结构一样，利用该特性可以做到与 % 运算一样的结果，让 sizemask = size - 1 就是为了让 size 的低位为 1，这样 key 与 sizemask 做与运算时只需要考虑低位即可，
+以此达到 key = 2^n + q 的效果。
+
+```text
+哈希表数组(dictEntry*[4]):
++-----+-----+-----+-----+
+| [0] | [1] | [2] | [3] |
++-----+-----+-----+-----+
+|  ↘  |  ↘  | NULL| NULL|
++-----+-----+-----+-----+
+     |     |
+     |     +------------------+
+     |                        |
+     v                        v
++------------+            +------------+
+|  dictEntry |            |  dictEntry |
++------------+            +------------+
+|   key: k1  |            |   key: k3  |
+|   val: v1  |            |   val: v3  |
+| *next:NULL |            | *next:     |
++------------+            +------------+
+                          |
+                          v
+                     +------------+
+                     |  dictEntry |
+                     +------------+
+                     |   key: k2  |
+                     |   val: v2  |
+                     | *next:NULL |
+                     +------------+
+```
+
+插入 k1 -> v1 时，先计算 k1 的哈希值，假设计算结果 index = 0，然后就查找槽位 [0]，发现为空，直接新建节点，插入 k2 -> v2 同理；如果此时插入 k3 -> v3 与 k2 发生哈希冲突，
+此时就会更新结构，使用头插法插入 [1] 号槽位的第一个位置，让 k2 链接在 k3 后面，以此提高插入效率，避免使用尾插法遍历整个链表。而 Redis 是单线程模型，所有操作都在一个线程中完成，
+所以天然避免了并发冲突，也就不会像 Java 的 Hash 结构那样。
+
+```c
+// 字典本体，管理哈希表、扩容状态等
+typedef struct dict {
+    dictType *type; // dict 类型，内置不同的 hash 函数
+    void *privdata; // 私有数据，在做特殊 rehash 运算时用
+    dictht ht[2]; // 一个 Dict 包含两个哈希表，其中一个是存放当前数据，另一个一般是空的，rehash 时再使用
+    long rehashidx; // rehash 的进度，-1 表示未进行
+    int16_t pauserehash; // 用来判断 rehash 是否暂停，1 则暂停，0 则继续
+} dict;
+```
+
+Dict 的扩容：
+
+Dict 中的哈希表就是数组结合单向链表的实现，当集合中元素较多时，必然导致哈希冲突增多，链表过长也会导致查询效率大大降低。所以在每次执行插入、更新等操作前，
+都会调用下面的 _dictExpandIfNeeded 方法，用来动态判断是否需要扩容。判断条件则是负载因子（LoadFactor = used/size）的大小，
+负载因子 ≥ 1，即数据数量 ≥ 槽位数量，这是基础扩容的触发条件，此时系统允许扩容，但通常需要避免与 RDB、AOF 子进程冲突；当负载因子 > 强制扩容阈值（通常是 5），
+此时进行强制扩容，避免链表过长性能恶化。
+
+```c
+static int _dictExpandIfNeeded(dict *d) {
+    // 如果正在 rehash 就退出
+    if (dictIsRehashing(d)) return DICT_OK;
+
+    // 如果哈希表为空，则初始化哈希表为默认大小 4
+    if (d->ht[0].size == 0) return dictExpand(d, DICT_HT_INITIAL_SIZE);
+
+    // 当负载因子（used/size）达到 1 以上，并且当前没有进行 bgsave、rewrite 等子进程操作
+    // 或者当负载因子超过 5，则进行 dictExpand，也就是扩容操作
+    if (d->ht[0].used >= d->ht[0].size &&
+        (dict_can_resize ||
+         d->ht[0].used/d->ht[0].size > dict_force_resize_ratio) &&
+        dictTypeExpandAllowed(d)) {
+        // 扩容大小为 used + 1，底层会对扩容大小进行判断，实际上是找第一个大于等于 used + 1 的 2^n
+        return dictExpand(d, d->ht[0].used + 1);
+    }
+    return DICT_OK;
+}
+```
+
+目标扩容容量为 used + 1，即现有元素数再多分配 1 个槽位，实际上，_dictExpand 内部会对传入的 size 参数处理，总是扩容到大于等于 used + 1 的最小 2 的幂次方
+
+```c
+unsigned long _dictNextPower(unsigned long size) {
+    unsigned long i = DICT_HT_INITIAL_SIZE;
+    while (1) {
+        if (i >= size) return i;
+        i *= 2;
+    }
+}
+```
+
+```c
+int dictExpand(dict *d, unsigned long size) {
+    return _dictExpand(d, size, NULL);
+}
+```
+
+传入 d：目标字典、size：希望扩容的槽位数量、malloc_failed：标记是否分配内存失败（初始为 null）。
+
+```c
+int _dictExpand(dict *d, unsigned long size, int* malloc_failed) {
+    if (malloc_failed) *malloc_failed = 0;
+    // 如果当前 entry 数量超过了要申请的 size 大小，或者正在 rehash，就直接报错
+    if (dictIsRehashing(d) || d->ht[0].used > size)
+        return DICT_ERR;
+    dictht n; // 声明新的哈希表
+    unsigned long realsize = _dictNextPower(size); // 计算实际数组大小，找到第一个大于等于 size 的 2 的幂次方
+    // 计算出的目标数组大小小于期望，逻辑出错
+    if (realsize < size || realsize * sizeof(dictEntry*) < realsize)
+        return DICT_ERR;
+
+    // 新的 size 与旧的 size 一致也报错
+    if (realsize == d->ht[0].size) return DICT_ERR;
+
+    // 重置新的 hash table 的大小和掩码
+    n.size = realsize;
+    n.sizemask = realsize-1;
+    if (malloc_failed) {
+        n.table = ztrycalloc(realsize*sizeof(dictEntry*));
+        *malloc_failed = n.table == NULL;
+        if (*malloc_failed)
+            return DICT_ERR;
+    } else
+        n.table = zcalloc(realsize*sizeof(dictEntry*)); // 分配内存
+
+    n.used = 0;
+
+    // 如果是第一次，直接把 n 赋值给 ht[0] 即可
+    if (d->ht[0].table == NULL) {
+        d->ht[0] = n;
+        return DICT_OK;
+    }
+    // 上面的不等于 null，证明有初始数据，即现在正在扩容或者收缩，那么就把 rehashidx 置为 0，在每次增删改查时都出发 rehash
+    d->ht[1] = n;
+    d->rehashidx = 0;
+    return DICT_OK;
+}
+```
+
+Dict 的 rehash：
+
+不管是扩容还是收缩，必定会创建新的哈希表，导致哈希表的 size 和 sizemask 变化，而 key 的查询与 sizemask 有关。因此必须对哈希表中的每一 key 重新计算索引，
+插入新的哈希表的过程则称为 rehash，而每次执行增删改查，触发一小步搬迁：
+
+```c
+int dictRehash(dict *d, int n) {
+    int empty_visits = n*10; // 限制空桶访问最大次数，避免极端情况下陷入死循环
+    if (!dictIsRehashing(d)) return 0; // 判断是否在 rehash，如果在则继续进行搬迁
+
+    while(n-- && d->ht[0].used != 0) { // 判断条件为需要搬迁的槽位和 ht[0] 表中的数据
+        dictEntry *de, *nextde;
+
+        // rehashidx 用来记录搬迁进度，不能超出旧表数组边界
+        assert(d->ht[0].size > (unsigned long)d->rehashidx);
+        while(d->ht[0].table[d->rehashidx] == NULL) {
+            d->rehashidx++;
+            if (--empty_visits == 0) return 1;
+        }
+        de = d->ht[0].table[d->rehashidx];
+        // 搬迁链表上的所有节点
+        while(de) {
+            uint64_t h;
+
+            nextde = de->next; // 重新计算新表索引
+            h = dictHashKey(d, de->key) & d->ht[1].sizemask; // 头插法插入新表
+            de->next = d->ht[1].table[h];
+            d->ht[1].table[h] = de;
+            d->ht[0].used--;
+            d->ht[1].used++;
+            de = nextde;
+        }
+        d->ht[0].table[d->rehashidx] = NULL;
+        d->rehashidx++;
+    }
+
+    // 检查 rehash 是否结束
+    if (d->ht[0].used == 0) {
+        zfree(d->ht[0].table); // 释放旧表内存
+        d->ht[0] = d->ht[1]; // 新表变为主表
+        _dictReset(&d->ht[1]); // 重置 ht[1]，准备下次扩容
+        d->rehashidx = -1; // 标记 rehash 结束
+        return 0;
+    }
+
+    // 搬迁未完成，返回 1 作为标记
+    return 1;
+}
+```
+
+计算新哈希表的 realSize，值取决于当前要做的是扩容还是收缩，但本质上是一致的，扩容是找到 used + 1 的最小 2^n，收缩则是找到最接近 used 的最小 2^n。
+不管怎么样，最终都会进行 rehash，然后把新哈希表的 size 传进去，rehash 操作并不会一次性完成，而是分多次完成，然后下次继续从 ht[0] 中转移元素，
+而查询、修改、删除操作则是依次对这两个表进行查找，不过新增操作则是直接写进 ht[1] 中，这样就可以避免再从 ht[0] 中移动一遍，也就是说，rehash 时 ht[0] 只减不增，
+直到 ht[0] 为空，然后再重置 ht[1]。
+
+****
+### 4. ZipList
+
+ZipList（压缩列表） 是 Redis 中一种为节省内存而设计的特殊数据结构，它的底层由一块连续的内存区域组成，类似数组，但它并不使用传统链表那样的“前后指针”来串联元素。
+ZipList 是通过一套编码规则和内部字段来自行推算每个元素的准确位置。ZipList 中所有存储长度的数值均采用小端字节序，即低位字节在前，高位字节在后。
+例如：数值 0x12|34，采用小端字节序后实际存储值为：0x34|12
+
+结构：
+
+- zlbytes：4 字节，用于记录整个 ZipList 占用的内存总字节数（包含所有字段）     
+- zltail：4 字节，用于记录最后一个 Entry 节点到 ZipList 起始位置的偏移量（字节单位）    
+- zllen：2 字节，用于记录 Entry 节点数量（最大 65535，超过则需遍历统计）
+- Entry 列表：可变长度，实际存储数据的节点集合
+- zlend：1 字节，用于固定结束标记（0xFF），0xFF                       
+
+每个 Entry 包含 revlen（前驱节点长度）、encoding（数据编码）、data（实际数据）：
+
+- previous_entry_length
+
+前一节点的长度，占 1 个或 5 个字节，如果前一节点的长度小于 254 字节，则采用 1 个字节来保存这个长度值；如果前一节点的长度大于 254 字节，则采用 5 个字节来保存这个长度值。
+第 1 字节存 0x00，后 4 字节存真正的前一节点长度，使用小端字节序
+
+- encoding
+
+表示当前节点数据类型和长度，支持字符串类型和整数类型
+
+- contents
+
+负责保存节点的数据，可以是字符串或整数。
+
+字符串类型：
+
+编码信息中低两位或高两位区分类型：
+
+- 00xxxxxx：字符串，长度小于 64 字节 
+- 01xxxxxx xxxxxxxx：字符串，长度小于 16384 字节 
+- 10000000 后跟 32 位长度：超大字符串
+
+例如保存字符串 "ab" 和 "bc"：
+
+第一个节点 "ab"：
+
+```text
++-----------------------+-----------------+------------------+
+| previous_entry_length | encoding (类型) | contents (数据)   |
++-----------------------+-----------------+------------------+
+|         0x00          | 0b00000010      | 'a' 'b'          |
++-----------------------+-----------------+------------------+
+```
+
+由于 "ab" 是第一个节点，前面没有节点，所以只占 1 字节，存放 0x00，值为 0，存放的 "ab" 长度为 2 字节（只用 1 字节保存长度），所以编码为 0b00000010（最高两位 00 表示字符串，后 6 位存长度），
+contents 部分只有两个字符，所以占 2 字节，整体就是 4 字节。
+
+第二个节点 "bc"：
+
+```text
++-----------------------+-----------------+------------------+
+| previous_entry_length | encoding (类型) | contents (数据)   |
++-----------------------+-----------------+------------------+
+|         0x04          | 0b00000010      | 'b' 'c'          |
++-----------------------+-----------------+------------------+
+```
+
+前一个节点总长度 = 1（prevlen）+ 1（encoding）+ 2（数据） = 4，因此存储 0x04（1字节）;字符串类型，长度为 2（用 1 字节存储），contents 占用 2 字节，所以整体为 4 字节
+
+```text
++-------------+-------------+----------+-----------------------+-----------------+------------------+-----------------------+-----------------+------------------+-------+
+|   zlbytes   |   zltail    |  zllen   | previous_entry_length | encoding (类型) | contents ('ab')  | previous_entry_length | encoding (类型)  | contents ('bc')  | zlend |
++-------------+-------------+----------+-----------------------+-----------------+------------------+-----------------------+-----------------+------------------+-------+
+| 0x14|000000 | 0x0E|000000 | 0x01|00  |         0x00          |    0b00000010   |  'a' 'b'         |         0x04          |   0b00000010    |    'b' 'c'       | 0xFF  |
++-------------+-------------+----------+-----------------------+-----------------+------------------+-----------------------+-----------------+------------------+-------+
+```
+
+头部总长度 = zlbytes(4) + zltail(4) + zllen(2) = 10 字节；节点总长度 = 节点 1 (4) + 节点 2 (4) = 8 字节；zlend 长度 = 1 字节；
+总长度 = 10 + 8 + 1 = 19 字节，但 Redis 内部通常会按 4 字节对齐，19 字节需向上取整为 20 字节
+
+整数类型：
+
+如果 encoding 是以 “11” 开始，则证明 content 是整数，且 encoding 固定只占用 1 个字节来表示长度：
+
+| 编码标识         | 占用字节  | 含义                                    |
+| ------------ | ----- |---------------------------------------|
+| `0b11000000` | 1 字节  | 8 位有符号整数（-128 ~ 127）                  |
+| `0b11010000` | 2 字节  | 16 位有符号整数（-32,768 ~ 32,767）           |
+| `0b11100000` | 3 字节  | 24 位有符号整数                             |
+| `0b11110000` | 4 字节  | 32 位有符号整数                             |
+| `0b11111110` | 8 字节  | 64 位有符号整数                             |
+| `0b1111xxxx` | 无额外字节 | 直接存储，范围从0001~1101，减1后结果为实际值 0 ~ 12 的小整数 |
+
+例如存整数 1 和 99：
+
+```text
++-----------------------+-----------------+
+| previous_entry_length | encoding (类型) |
++-----------------------+-----------------+
+|        0x00           | 0b11110001      |
++-----------------------+-----------------+
+```
+
+因为是小整数，所以可以省略 contents，整体为 1 + 1 = 2 字节
+
+```text
++-------------+-------------+----------+-----------------------+-----------------+-------+
+|   zlbytes   |    zltail   |   zllen  | previous_entry_length | encoding (类型) | zlend |
++-------------+-------------+----------+-----------------------+-----------------+-------+
+| 0x10|000000 | 0x0A|000000 | 0x01|00  |         0x00          |    0b11110001   | 0xFF  |
++-------------+-------------+----------+-----------------------+-----------------+-------+
+```
+
+头部总长度 = zlbytes(4) + zltail(4) + zllen(2) = 10 字节；节点总长度 = 2 字节；zlend 长度 = 1 字节；
+总长度 = 10 + 2 + 1 = 13 字节，但 Redis 内部通常会按 4 字节对齐，13 字节需向上取整为 16 字节。
+
+现在存入 99：
+
+```text
++-----------------------+-----------------+------------------+
+| previous_entry_length | encoding (类型) | contents (数据)   |
++-----------------------+-----------------+------------------+
+|       0x02            |    0b11000000   |      99          |
++-----------------------+-----------------+------------------+
+```
+
+前一个节点长度为 2 字节，所以 previous_entry_length = 2（0x02）；99 不属于小整数范围，所以需要用 8 位整数存储，即 0b11000000；
+contents 存放 99，占 1 字节，总共 1 + 1 + 1 = 3 字节。
+
+```text
++-------------+-------------+---------+-----------------------+-----------------+-----------------------+-----------------+------------------+-------+
+|   zlbytes   |    zltail   |  zllen  | previous_entry_length | encoding (类型) | previous_entry_length | encoding (类型)  | contents (数据)   | zlend |
++-------------+-------------+---------+-----------------------+-----------------+-----------------------+-----------------+------------------+-------+
+| 0x10|000000 | 0x0C|000000 | 0x02|00 |         0x00          |    0b11110001   |         0x02          |    0b11000000   |       99         | 0xFF  |
++-------------+-------------+---------+-----------------------+-----------------+-----------------------+-----------------+------------------+-------+
+```
+
+头部总长度 = zlbytes(4) + zltail(4) + zllen(2) = 10 字节；节点总长度 = 节点 1 (2) + 节点 2 (3) = 5 字节；zlend 长度 = 1 字节；
+总长度 = 10 + 5 + 1 = 16 字节。
+
+由以上内容可以得知：ZipList 的每个 Entry 都包含 previous_entry_length 来记录上一个节点的大小，长度是 1 个或 5 个字节，如果前一节点的长度小于 254 字节，则采用 1 个字节来保存这个长度值；
+如果前一节点的长度大于等于 254 字节，则采用 5 个字节来保存这个长度值，然后第一个字节就成为 0xFE（用于标识前一个节点的真实长度大于等于 254 字节），
+后四个字节才是真实长度数据。现在，假设有 N 个连续的、长度为 250~253 字节之间的 entry，因此 entry 的 previous_entry_length 属性用 1 个字节即可表示，
+但是当插入或删除某个数据后，让某个节点的长度大于 254 字节了，这就导致下一个节点的 previous_entry_length 要变成 5 字节，
+也就是新增 4 字节，然后该节点的长度也大于 254 字节了，以此类推，就会产生连续多次的空间扩展操作，称为连锁更新。
+
+****
+### 5. QuickList
+
+ZipList 虽然节省内存，但申请的内存必须是连续空间，如果内存占用较多，那么申请内存的效率就很低，所以必须限制 ZipList 的长度和 entry 大小，所以可以考虑创建多个 ZipList 来分片存储数据，
+但由于 ZipList 是不带指针的，所以分散后不便于管理，所以 Redis 引入了 QuickList 结构，它是一个双端链表，只不过链表中的每个节点都是一个 ZipList，并且中间节点可以压缩，进一步节省了内存
+
+为了避免 QuickList 中的每个 ZipList 中 entry 过多，Redis 提供了一个配置项 list-max-ziplist-size 来限制，如果值为正数 N，则代表 ZipList 的允许的 entry 个数的最大值为 N，
+如果值为负，则代表 ZipList 的最大内存大小，分 5 种情况（也就是 fill 的值）：
+
+* -1：每个 ZipList 的内存占用不能超过 4kb
+* -2：每个 ZipList 的内存占用不能超过 8kb（默认值）
+* -3：每个 ZipList 的内存占用不能超过 16kb
+* -4：每个 ZipList 的内存占用不能超过 32kb
+* -5：每个 ZipList 的内存占用不能超过 64kb
+
+```c
+typedef struct quicklist {
+    quicklistNode *head; // 头节点指针
+    quicklistNode *tail; // 尾节点指针
+    unsigned long count; // 所有 ZipList 中 Entry 总数  
+    unsigned long len; // QuickListNode 节点数量
+    int fill : QL_FILL_BITS; // 节点容量控制参数（正值: Entry 数；负值: 内存 KB）
+    unsigned int compress : QL_COMP_BITS; // 两端不压缩节点数量
+    unsigned int bookmark_count: QL_BM_BITS; // 书签数量（用于快速定位）
+    quicklistBookmark bookmarks[]; // 书签数组
+} quicklist;
+```
+
+```c
+typedef struct quicklistNode {
+    struct quicklistNode *prev; // 前驱节点
+    struct quicklistNode *next; // 后继节点
+    unsigned char *zl; // 指向 ZipList 的内存
+    unsigned int sz; // ZipList 占用字节数
+    unsigned int count : 16; // ZipList 中 Entry 数量
+    unsigned int encoding : 2; // 编码类型：RAW==1 或 LZF==2（压缩标志）
+    unsigned int container : 2; // 数据容器类型：NONE==1 或 ZIPLIST==2
+    unsigned int recompress : 1; // 节点是否处于解压态，操作完成后需重新压缩
+    unsigned int attempted_compress : 1; // 压缩尝试失败标志，数据过小不压缩
+    unsigned int extra : 10; // 预留扩展位
+} quicklistNode;
+```
+
+****
+### 6. SkipList
+
+跳表（SkipList）是一种有序数据结构，它通过多级索引加速搜索、插入和删除。从最高层级开始向下查找，沿前向指针搜索，遇到大于目标的节点就移动到下移一层，
+重复直到第 1 层，然后逐个比较找到目标；而当元素插入后，由 Redis 随机决定新节点的层数。
+
+```c
+typedef struct zskiplist {
+    struct zskiplistNode *header, *tail; // 头尾节点
+    unsigned long length; // 跳表长度
+    int level; // 当前最大层数
+} zskiplist;
+```
+
+```c
+typedef struct zskiplistNode {
+    sds ele; // 元素值
+    double score; // 排序分数
+    struct zskiplistNode *backward; // 后退指针，支持反向遍历
+    struct zskiplistLevel {
+        struct zskiplistNode *forward; // 每层前向指针
+        unsigned int span; // 跨度，用于排名计算
+    } level[]; // 多层索引数组
+} zskiplistNode;
+```
+
+每个节点随机拥有不同层数索引，越高层数的节点越稀疏，查找过程自顶向下，快速缩小范围，最多可以拥有 32 级索引
+
+```text
+Level 3:  A ------------> D
+Level 2:  A ----> B ----> D ----> E
+Level 1:  A -> B -> C -> D -> E -> F
+```
+
+SkipList 的特点：
+
+* 跳跃表是一个双向链表，每个节点都包含 score 和 ele 值
+* 节点按照 score 值排序，score 值一样则按照 ele 字典排序
+* 每个节点都可以包含多层指针，层数是 1 到 32 之间的随机数
+* 不同层指针到下一个节点的跨度不同，层级越高，跨度越大
+* 增删改查效率与红黑树基本一致，实现却更简单
+
+****
+### 7. RedisObject
+
+Redis 中的任意数据类型的键和值都会被封装为一个 RedisObject，也叫做 Redis 对象。
+对于 Redis 使用者而言，操作的核心是 database（数据库），它是一个逻辑上的键值对容器，非集群模式下默认有 16 个 database（编号 0~15），可通过 SELECT id 切换。
+而集群模式下仅支持 1 个 database（编号 0），这是因为集群需要将数据分片到不同节点，多个数据库会增加分片复杂度。
+key 固定为字符串类型（如 user:100、counter），且在单个数据库内唯一；但 value 支持多种数据类型（string、list、hash、set、sorted set 等），通过 SET、LPUSH、HSET 等命令操作不同类型的 value。
+每个数据库就像一个 “大字典”，通过 Dict（字典）作为容器，sds（动态字符串）存储 key，robj（redisObject）封装 value 这三大核心结构维护 key-value 的映射关系。
+
+Dict 就是存放映射关系的容器，每个数据库内部通过一个 Dict 结构体管理所有键值对，相当于哈希表，实现 key 到 value 的快速映射，而 Dict 的 key 以 sds 类型存储，
+因为 value 支持多种类型，所以想要在 Dict 中统一存储就需要进行封装，可以用 robj（redisObject）结构体封装所有类型的 value。
+
+```c
+typedef struct redisObject {
+    unsigned type : 4; // 数据类型
+    unsigned encoding : 4; // 编码方式
+    unsigned lru : 24; // LRU 时间戳或 LFU 计数
+    int refcount; // 引用计数
+    void *ptr; // 指向真实数据的指针
+} robj;
+```
+
+type：
+
+```c
+#define OBJ_STRING  0
+#define OBJ_LIST    1
+#define OBJ_SET     2
+#define OBJ_ZSET    3
+#define OBJ_HASH    4
+#define OBJ_MODULE  5
+#define OBJ_STREAM  6
+```
+
+这些是 RedisObject 支持的主要逻辑类型，初始化时通过指定数字来选择需要封装的类型。
+
+encoding：
+
+| **编号** | **编码方式**            | **说明**               |
+| -------- | ----------------------- | ---------------------- |
+| 0        | OBJ_ENCODING_RAW        | raw编码动态字符串      |
+| 1        | OBJ_ENCODING_INT        | long类型的整数的字符串 |
+| 2        | OBJ_ENCODING_HT         | hash表（字典dict）     |
+| 3        | OBJ_ENCODING_ZIPMAP     | 已废弃                 |
+| 4        | OBJ_ENCODING_LINKEDLIST | 双端链表               |
+| 5        | OBJ_ENCODING_ZIPLIST    | 压缩列表               |
+| 6        | OBJ_ENCODING_INTSET     | 整数集合               |
+| 7        | OBJ_ENCODING_SKIPLIST   | 跳表                   |
+| 8        | OBJ_ENCODING_EMBSTR     | embstr的动态字符串     |
+| 9        | OBJ_ENCODING_QUICKLIST  | 快速列表               |
+| 10       | OBJ_ENCODING_STREAM     | Stream流               |
 
 
+lru：
 
+一种内存淘汰机制，默认是 LRU（最近最少使用）策略，记录访问时间戳；也可以选择 LFU（最不常用）策略，记录访问频率；占 24 位。
+
+ptr，根据类型与编码方式不同，指向不同结构：
+
+| type        | encoding                 | ptr 真实指向     |
+| ----------- | ------------------------ | ------------ |
+| OBJ\_STRING | OBJ\_ENCODING\_RAW       | sds 动态字符串    |
+| OBJ\_STRING | OBJ\_ENCODING\_INT       | 存储整数值（指针强转）  |
+| OBJ\_LIST   | OBJ\_ENCODING\_QUICKLIST | QuickList 结构 |
+| OBJ\_SET    | OBJ\_ENCODING\_HT        | 字典结构         |
+| OBJ\_SET    | OBJ\_ENCODING\_INTSET    | 整数集合         |
+| OBJ\_ZSET   | OBJ\_ENCODING\_SKIPLIST  | 跳表结构         |
+| OBJ\_ZSET   | OBJ\_ENCODING\_ZIPLIST   | 压缩列表         |
+| OBJ\_HASH   | OBJ\_ENCODING\_HT        | 字典结构         |
+| OBJ\_HASH   | OBJ\_ENCODING\_ZIPLIST   | 压缩列表         |
+
+****
+### 8. String 结构
+
+String 是 Redis 中最常见的数据存储类型，它有三种编码方式，分别为 RAW、EMBSTR、INT。
+
+RAW：
+
+RAW 是基于简单动态字符串实现的，存储长字符串（长度 > 44 字节）或非整数的字符串（即使长度较短，但无法用 INT 编码时），存储上限为 512 MB，SDS 是一个独立的内存空间，由 ptr 指针指向。
+但是如果⼀个 String 类型的 value 的值是数字，那么 Redis 内部会把它转成 long 类型来存储，从⽽减少内存的使用。如果该数字是整数，
+且大小在 long 类型所能表示的最大整数范围内，则会直接将数据保存在 RedisObject 的 ptr 指针位置（刚好8字节），不再需要 SDS 了，但实际的操作仍然是针对 String 类型。
+
+EMBSTR：
+
+存储短字符串（长度 ≤ 44 字节），它和 RedisObject 一起存放在一片连续的内存空间中，以此减少内存碎片，并且 EMBSTR 编码的字符串是只读的，若执行修改操作（如 APPEND），会先转换为 RAW 编码。
+因为该特性，分配或释放内存时，EMBSTR 只需 1 次系统调用，RAW 需要 2 次（分别为 redisObject 和 sds 分配内存）。
+
+INT：
+
+存储 64 位有符号整数（范围：-2^63 ~ 2^63-1），直接将整数值存储在 redisObject 的 ptr 字段中（无需额外分配内存存储字符串），节省空间，且无需进行字符串与整数的转换。
+
+所以，String 在 Redis 中是⽤⼀个 robj 来表示的。用来表示 String 的 robj 可能编码成 3 种内部表⽰：OBJ_ENCODING_RAW，OBJ_ENCODING_EMBSTR，OBJ_ENCODING_INT。
+其中前两种编码使⽤的是 sds 来存储，最后⼀种 OBJ_ENCODING_INT 编码直接把 string 存成了 long 型。
+
+```redis
+SET key "32"
+OK
+OBJECT ENCODING key
+"int"
+```
+
+初始 "32" 可编码为 INT，SETBIT 修改 ASCII 码（针对字符串的二进制位操作），结果字符串变 "22"，并且编码切换为 RAW。所以在使用 SETBIT 的时候，Redis 将 "32" 先转换回了 String 类型，
+然后基于 sds 字符串执行 SETBIT 操作
+
+```redis
+# 将 "32" 的第 0 字节的第 7 位比特位修改为相反的
+SETBIT key 7 0
+(integer) 1
+GET key
+"22"
+OBJECT ENCODING key
+"raw"
+```
+
+****
+### 9. List
+
+Redis 的 List 类型可以从首、尾操作列表中的元素
+
+```redis
+LPUSH list
+RPUSH list
+```
+
+在 3.2 版本以前，Redis 采用 ZipList 和 LinkedList 来实现 List，当元素数量小于 512 并且元素大小小于 64 字节时采用 ZipList 编码，超过则采用 LinkedList 编码。
+3.2 之后则统一采用 QuickList 来实现。
+
+* LinkedList ：普通链表，可以从双端访问，内存占用较高，内存碎片较多
+* ZipList ：压缩列表，可以从双端访问，内存占用低，存储上限低
+* QuickList：LinkedList + ZipList，可以从双端访问，内存占用较低，包含多个 ZipList，存储上限高
+
+list 中由 pushGenericCommand 统一封装两端插入逻辑，通过传入要操作的具体位置来实现头尾的双端操作：
+
+```c
+// 所有的操作最终会封装到 *c 中，然后从这个结构中获取对象
+void pushGenericCommand(client *c, int where, int xx) {
+    int j;
+    // 判断元素大小，不能超过 LIST_MAX_ITEM_SIZELIST_MAX_ITEM_SIZE
+    // 例如 LPUSH key v1 v2，LPUSH 就是 argv[0]
+    for (j = 2; j < c->argc; j++) {
+        // 从第二个位置开始获取 value 值
+        if (sdslen(c->argv[j]->ptr) > LIST_MAX_ITEM_SIZE) {
+            addReplyError(c, "Element too large");
+            return;
+        }
+    }
+    // 尝试找到 key 对应的 list
+    robj *lobj = lookupKeyWrite(c->db, c->argv[1]); // 传入客户端要访问的数据库和 key
+    if (checkType(c,lobj,OBJ_LIST)) return;
+    // 判断 list 是否为空
+    if (!lobj) {
+        if (xx) { // xx 默认传入 false，所以一般会默认创建新的 QuickList
+            addReply(c, shared.czero);
+            return;
+        }
+        // 创建 QuickList，在这个方法里会把 list 的编码方式设置为 OBJ_ENCODING_QUICKLIST
+        lobj = createQuicklistObject();
+        quicklistSetOptions(lobj->ptr, server.list_max_ziplist_size,
+                            server.list_compress_depth);
+        dbAdd(c->db,c->argv[1],lobj);
+    }
+    // 插入数据
+    for (j = 2; j < c->argc; j++) {
+        listTypePush(lobj,c->argv[j],where);
+        server.dirty++;
+    }
+
+    addReplyLongLong(c, listTypeLength(lobj));
+
+    char *event = (where == LIST_HEAD) ? "lpush" : "rpush";
+    signalModifiedKey(c,c->db,c->argv[1]);
+    notifyKeyspaceEvent(NOTIFY_LIST,event,c->argv[1],c->db->id);
+}
+```
+
+```redis
+robj *createQuicklistObject(void) {
+    quicklist *l = quicklistCreate(); // 创建 QuickList
+    robj *o = createObject(OBJ_LIST,l); // 创建 RedisObject，type 为 OBJ_LIST，ptr 指向 QuickList
+    o->encoding = OBJ_ENCODING_QUICKLIST; // 设置编码为 QuickList
+    return o;
+}
+```
+
+结构图：
+
+```text
++------------------+------------------+------------------+------------------+------------------+
+| *head            | *tail            | count            | fill factor      | compress         |
+| (指向首节点)       | (指向尾节点)       | (总元素数量)      | (ZipList大小限制) | (首尾不压缩深度)    |
++------------------+------------------+------------------+------------------+------------------+
+        |                   |
+        v                   v
+```
+
+```text
++------------------+       +------------------+       +------------------+
+| QuickListNode #1 | <---> | QuickListNode #2 | <---> | QuickListNode #3 |
++------------------+       +------------------+       +------------------+
+| *prev            |       | *prev            |       | *prev            |
+| *next            |       | *next            |       | *next            |
+| *zl              |       | *zl              |       | *zl              |
+| sz=16            |       | sz=24            |       | sz=8             |
+| encoding=RAW     |       | encoding=RAW     |       | encoding=RAW     |
+| container=ZIPLIST|       | container=ZIPLIST|       | container=ZIPLIST|
++------------------+       +------------------+       +------------------+
+        |                         |                         |
+        v                         v                         v
+   +---------+               +---------+               +---------+
+   | ZipList |               | ZipList |               | ZipList |
+   +---------+               +---------+               +---------+
+   | zlbytes |               | zlbytes |               | zlbytes |
+   | zltail  |               | zltail  |               | zltail  |
+   | zllen=3 |               | zllen=5 |               | zllen=2 |
+   | Entry1  |               | Entry1  |               | Entry1  |
+   | Entry2  |               | Entry2  |               | Entry2  |
+   | Entry3  |               | ...     |               | zlend   |
+   | zlend   |               | zlend   |               +---------+
+   +---------+               +---------+
+```
+
+****
+### 10. Set
+
+Set 是 Redis 中的单列集合，满足下列特点：
+
+* 不保证有序性
+* 保证元素唯一
+* 求交集、并集、差集
+
+Set 内部提供了很多方法，它们底层都是要快速找到某个元素，所以 Set 对元素的查询效率要求很高，而 Redis 提供了两套方案：
+
+- 使用哈希编码，用 Dict 的 key 用来存储元素，value 设置为 null，虽然保证了高效与不可重复，但内部具有较多指针，会占用较多内存
+- 当使用的所有数据都是整数类型，并且元素数量不超过 set-max-intset-entries 时，Set 会采用 IntSet 编码，以节省内存
+
+```c
+robj *setTypeCreate(sds value) {
+    // 判断 value 是否为数值类型
+    if (isSdsRepresentableAsLongLong(value,NULL) == C_OK)
+        // 如果是则采用 intset 编码方式
+        return createIntsetObject();
+    // 否则采用默认编码，也就是哈希编码
+    return createSetObject();
+}
+```
+
+```c
+robj *createIntsetObject(void) {
+    intset *is = intsetNew(); // 初始化 intset 并分配内存
+    robj *o = createObject(OBJ_SET,is); // 创建 RedisObject 对象
+    o->encoding = OBJ_ENCODING_INTSET; // 指定编码
+    return o;
+}
+```
+
+在每一次插入新元素时，底层会检查插入的元素是否为数值类型，只要不是就立即将 intset 编码转换成默认编码
+
+```c
+// subject 就是设置编码时返回的 RedisObject 对象
+int setTypeAdd(robj *subject, sds value) { 
+    long long llval;
+    if (subject->encoding == OBJ_ENCODING_HT) { // 判断是否为默认编码，如果是则直接插入元素
+        dict *ht = subject->ptr;
+        dictEntry *de = dictAddRaw(ht,value,NULL);
+        if (de) {
+            dictSetKey(ht,de,sdsdup(value));
+            dictSetVal(ht,de,NULL);
+            return 1;
+        }
+    } else if (subject->encoding == OBJ_ENCODING_INTSET) { // 如果是 intset 编码
+        if (isSdsRepresentableAsLongLong(value,&llval) == C_OK) { // 判断是否是整数类型
+            uint8_t success = 0;
+            subject->ptr = intsetAdd(subject->ptr,llval,&success);
+            if (success) {
+                // 当 intset 元素超出设置的 set_max_intset_entries 就转为默认编码
+                size_t max_entries = server.set_max_intset_entries; 
+                if (max_entries >= 1<<30) max_entries = 1<<30;
+                if (intsetLen(subject->ptr) > max_entries)
+                    setTypeConvert(subject,OBJ_ENCODING_HT);
+                return 1;
+            }
+        } else {
+            // 不是整数类型则设置为默认编码
+            setTypeConvert(subject,OBJ_ENCODING_HT);
+            // 通过哈希表的插入操作将元素插入 set 集合
+            serverAssert(dictAdd(subject->ptr,sdsdup(value),NULL) == DICT_OK);
+            return 1;
+        }
+    } else {
+        serverPanic("Unknown set encoding");
+    }
+    return 0;
+}
+```
+
+****
 
 
 
