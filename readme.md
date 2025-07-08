@@ -7888,6 +7888,798 @@ int setTypeAdd(robj *subject, sds value) {
 ```
 
 ****
+### 11. ZSet
+
+ZSet 也就是 SortedSet，其中每一个元素都需要指定一个 score 值和 member 值：
+
+* score 可重复，可以根据 score 来排序
+* member 必须唯一
+* 可以根据 member 查询 score
+
+```redis
+# m 是 member，数字是 score
+ZADD z1 10 m1 20 m2 30 m3
+```
+
+因此，zset 底层数据结构必须满足键值存储、键必须唯一、可排序这几个需求。
+
+* SkipList：按照升序排序，并且可以同时存储 score 和 ele 值（member）
+* HT（Dict）：可以键值存储并保证 key 的唯一（代替 member），可以根据 key 找 value
+
+所以 ZSet 的底层就是使用这两种结构，dict 提供快速查找（根据 member 查 score）；skiplist 提供有序访问（根据 score 查范围）
+
+```c
+typedef struct zset {
+    dict *dict; // Dict 指针
+    zskiplist *zsl; // SkipList 指针
+}zset;
+```
+
+```c
+robj *createZsetObject(void) {
+    zset *zs = zmalloc(sizeof(*zs));
+    robj *o;
+    // 创建 Dict
+    zs->dict = dictCreate(&zsetDictType,NULL);
+    // 创建 SkipList
+    zs->zsl = zslCreate();
+    o = createObject(OBJ_ZSET,zs);
+    o->encoding = OBJ_ENCODING_SKIPLIST;
+    return o;
+}
+```
+
+由此可知，ZSet 这种结构十分占用内存，因为它内部维护了两份数据，但当元素数量不多时，HT 和 SkipList 的优势不明显，却占用较多内存，所以 Redis 规定 ZSet 也可以采用 ZipList 结构来节省内存，不过需要同时满足两个条件：
+
+* 元素数量小于 zset_max_ziplist_entries，默认值 128
+* 每个元素都小于 zset_max_ziplist_value字节，默认值 64
+
+ZipList 本身没有排序功能，而且没有键值对的概念，但可以通过模拟键值对的方式，让 element 在前，score 在后，只要获取到 element，它的下一个节点就是 score：
+
+* ZipList 是连续内存，因此 score 和 element 是紧挨在一起的两个 entry， element 在前，score 在后
+* score 越小越接近队首，score 越大越接近队尾，按照 score 值升序排列
+
+
+
+```c
+// zadd 添加元素时，先根据 key 找到 zset，不存在则创建新的 zset
+zobj = lookupKeyWrite(c->db,key);
+if (checkType(c,zobj,OBJ_ZSET)) goto cleanup;
+// 判断是否存在
+if (zobj == NULL) { // zset 不存在
+    if (server.zset_max_ziplist_entries == 0 || server.zset_max_ziplist_value < sdslen(c->argv[scoreidx+1]->ptr)) { 
+        // zset_max_ziplist_entries 设置为 0 就是禁用了 ZipList
+        // 或者 value 大小超过了 zset_max_ziplist_value，则采用 HT + SkipList
+        zobj = createZsetObject();
+    } else {
+        // 否则正常使用 ZipList
+        zobj = createZsetZiplistObject();
+    }
+    dbAdd(c->db,key,zobj);
+}
+```
+
+使用 ZipList 结构时，它的底层就不存在 ZSet 结构了，直接使用 ZipList 代替
+
+```c
+robj *createZsetZiplistObject(void) {
+    // 创建 ZipList
+    unsigned char *zl = ziplistNew();
+    robj *o = createObject(OBJ_ZSET,zl);
+    o->encoding = OBJ_ENCODING_ZIPLIST;
+    return o;
+}
+```
+
+```c
+int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, double *newscore) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) { // 判断编码方式
+        unsigned char *eptr;
+        // 在 ziplist 中 顺序遍历查找目标 ele，并返回它的指针位置，若存在，还会通过 score 返回当前分数
+        if ((eptr = zzlFind(zobj->ptr,ele,&curscore)) != NULL) { // 是 ZipList 编码，证明可能有需要转换的风险
+           ...
+           return 1;
+        } else if (!xx) {
+            // 元素不存在，需要新增，然后根据 ZipList 长度有没有超、元素大小有没有超来判断是否需要转换编码
+            if (zzlLength(zobj->ptr)+1 > server.zset_max_ziplist_entries ||
+                sdslen(ele) > server.zset_max_ziplist_value ||
+                !ziplistSafeToAdd(zobj->ptr, sdslen(ele))) {
+                // 超出则转换成 SkipList 编码
+                zsetConvert(zobj,OBJ_ENCODING_SKIPLIST);
+            } else {
+                zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+                if (newscore) *newscore = score;
+                *out_flags |= ZADD_OUT_ADDED;
+                return 1;
+            }
+        } else {
+            *out_flags |= ZADD_OUT_NOP;
+            return 1;
+        }
+    }
+    // 本身就是 SkipList 编码则无需转化
+    if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
+        ...
+    }
+    ...
+    return 0;
+}
+```
+
+****
+### 12. Hash
+
+Hash 结构与 Redis 中的 ZSet 非常类似，都是键值存储、都需求根据键获取值、键必须唯一。但 ZSet 的键是 member，值是 score；而 hash 的键和值都是任意值，
+并且 ZSet 需要根据 score 排序，hash 则不需要排序。所以 hash 的底层结构就不需要像 ZSet 那样使用到 SkipList，直接使用 ZipList 或 Dict 即可，若满足以下条件则使用 ZipList 实现。
+
+* 元素数量小于 zset_max_ziplist_entries，默认值 512
+* 每个元素都小于 zset_max_ziplist_value 字节，默认值 64
+
+因为 ZipList 是一块连续的内存，每一次新增元素都可能触发扩容（连续内存不够），就需要申请一片新的内存空间，当 ZipList 的内容越多，拷贝的成本就越高，并且 Redis 是单线程的，
+极端情况下可能造成阻塞。
+
+```c
+// 封装 Redis 命令的方法， 例如 hset user1 name jack age 22
+void hsetCommand(client *c) {
+    int i, created = 0;
+    robj *o;
+    // 判断 hash 的 key 是否存在，不存在则新建，默认采用 ZipList 结构
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    // 判断是否需要把 ZipList 转换成 Dict
+    hashTypeTryConversion(o,c->argv,2,c->argc-1);
+    // 循环遍历每一个 field 和 value 并执行 hset 命令
+    for (i = 2; i < c->argc; i += 2)
+        created += !hashTypeSet(o,c->argv[i]->ptr,c->argv[i+1]->ptr,HASH_SET_COPY);
+    ...
+}
+```
+
+```c
+robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
+    // 通过 key 查找对应的 RedisObject
+    robj *o = lookupKeyWrite(c->db,key);
+    // 判断是否为 hash 类型
+    if (checkType(c,o,OBJ_HASH)) return NULL;
+    // 判断 RedisObjct 是否为空，为空证明 hash 结构不存在，则创建 hash 结构
+    if (o == NULL) {
+        o = createHashObject();
+        dbAdd(c->db,key,o);
+    }
+    return o;
+}
+```
+
+```c
+robj *createHashObject(void) {
+    // 默认采用 ZipList 编码，所以要申请一个 ZipList 内存空间
+    unsigned char *zl = ziplistNew();
+    robj *o = createObject(OBJ_HASH, zl);
+    // 设置 ZipList 编码
+    o->encoding = OBJ_ENCODING_ZIPLIST;
+    return o;
+}
+```
+
+```c
+// 接收 RedisBbject、命令参数数组，start 为 第一个 field 的下标，end 为最后一个 value 的下标
+void hashTypeTryConversion(robj *o, robj **argv, int start, int end) {
+    int i;
+    size_t sum = 0;
+    // 因为本方法是尝试把默认编码 ZipList 转换成 HT，所以如果本身就是 ZipList 编码，就无需进行
+    if (o->encoding != OBJ_ENCODING_ZIPLIST) return;
+    // 遍历 field 和 value
+    for (i = start; i <= end; i++) {
+        if (!sdsEncodedObject(argv[i]))
+            continue;
+        size_t len = sdslen(argv[i]->ptr);
+        判断 field 或 value 的下标是否超过 hash_max_ziplist_value 字节数
+        if (len > server.hash_max_ziplist_value) {
+            hashTypeConvert(o, OBJ_ENCODING_HT);
+            return;
+        }
+        sum += len;
+    }
+    // 判断该 hash 结构总的大小是否超出标准
+    if (!ziplistSafeToAdd(o->ptr, sum))
+        hashTypeConvert(o, OBJ_ENCODING_HT);
+}
+```
+
+以下就是 hash 的主要插入逻辑：
+
+```c
+int hashTypeSet(robj *o, sds field, sds value, int flags) {
+    int update = 0;
+    // 判断是否为 ZipList 编码
+    if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+        unsigned char *zl, *fptr, *vptr;
+        zl = o->ptr;
+        // 查询 ZipList 的第一个指针的位置
+        fptr = ziplistIndex(zl, ZIPLIST_HEAD);
+        if (fptr != NULL) { // head 不为空，说明 ZipList 不为空，那么就开始查找 key
+            fptr = ziplistFind(zl, fptr, (unsigned char*)field, sdslen(field), 1);
+            if (fptr != NULL) { // 判断是否存在，存在则更新
+                update = 1;
+                zl = ziplistReplace(zl, vptr, (unsigned char*)value,
+                        sdslen(value));
+            }
+        }
+        // 不存在，直接 push
+        if (!update) { // 依次 push 新的 field 和 value 到 ZipList 尾部
+            zl = ziplistPush(zl, (unsigned char*)field, sdslen(field),
+                    ZIPLIST_TAIL);
+            zl = ziplistPush(zl, (unsigned char*)value, sdslen(value),
+                    ZIPLIST_TAIL);
+        }
+        o->ptr = zl;
+        // 插入新元素后判断是否符合标砖，否则转成 HT 编码
+        if (hashTypeLength(o) > server.hash_max_ziplist_entries)
+            hashTypeConvert(o, OBJ_ENCODING_HT);
+    } else if (o->encoding == OBJ_ENCODING_HT) {
+        // 如果是 HT 编码，则直接进行插入或覆盖操作
+        ...
+    } else {
+        serverPanic("Unknown hash encoding");
+    }
+    ...
+    return update;
+}
+```
+
+****
+## 六. Redis 网络模型
+
+### 1. 用户空间和内核态空间
+
+常见的 Ubuntu、CentOS 等操作系统，其实都是 Linux 发行版，发行版 = Linux 内核 + 常用工具集（Shell、包管理器、图形界面等），无论是 Ubuntu 还是 CentOS，
+它们都属于 Linux 内核。而用户的应用，比如 redis，mysql 等其实是没有办法去直接访问操作系统的硬件的，所以可以通过发行版的这个壳子去访问内核，再通过内核去访问计算机硬件。
+计算机硬件包括 cpu，内存，网卡等等，内核（通过寻址空间）可以操作硬件的，但是内核需要不同设备的驱动，有了这些驱动之后，内核就可以去对计算机硬件去进行内存管理，文件系统的管理，进程的管理等等。
+
+如果想要通过用户应用来访问内核，计算机就必须要通过对外暴露的一些接口才能访问到，从而简便的实现对内核的操控，但是内核本身上来说也是一个应用，
+所以他本身也需要一些内存、cpu 等设备资源，而用户应用本身也在消耗这些资源，如果不加任何限制，用户随意的去操作这些资源，就有可能导致一些冲突，甚至有可能导致系统出现无法运行的问题，
+因此我们需要把用户和内核隔离开。
+
+寻址空间是指一个进程或系统可以访问的虚拟地址范围，它是操作系统为程序划分的一块连续的内存地址空间，进程的寻址空间划分成两部分：内核空间、用户空间。
+不管是应用程序，还是内核空间，都是没有办法直接访问物理内存的，只能通过分配一些虚拟内存映射到物理内存中，所以内核和应用程序去访问虚拟内存的时候，
+就需要这个虚拟地址，这个地址是一个无符号的整数，比如一个 32 位的操作系统，它的带宽就是 32，它的虚拟地址就是 2^32，也就是说他寻址的范围就是 0 ~ 2^32，
+这片寻址空间对应的就是 2^32 个字节，就是 4GB，其中会有 3GB 分给用户空间，1GB 给内核系统
+
+在 linux 中，它们权限分成两个等级，0 和 3，用户空间只能执行受限的命令（Ring 3），而且不能直接调用系统资源，必须通过内核提供的接口来访问；
+内核空间可以执行特权命令（Ring 0），调用一切系统资源，所以一般情况下，用户的操作是运行在用户空间，而内核运行的数据是在内核空间的，
+但有些情况需要一个应用程序去调用一些特权资源，去调用一些内核空间的操作，所以此时它们需要在用户态和内核态之间进行切换。
+
+比如 Linux 系统为了提高 IO 效率，会在用户空间和内核空间都加入缓冲区，写数据时，要把用户缓冲数据拷贝到内核缓冲区，然后写入设备；
+读数据时，要从设备读取数据到内核缓冲区，然后再拷贝到用户缓冲区。
+针对这个操作，用户在写读数据时，会去向内核态申请读取内核的数据，而内核数据要去等待驱动程序从硬件上读取数据，当从磁盘上加载到数据之后，
+内核会将数据写入到内核的缓冲区中，然后再将数据拷贝到用户态的缓冲区中，然后再返回给应用程序，整体而言，速度较慢。
+但实际情况下，通常希望 read/wait 等操作尽可能不阻塞，或者等待时间尽可能短。
+
+```text
+┌────────────────────────────┐
+│       应用程序（用户态）       │
+│  调用 read()                │
+└────────────┬───────────────┘
+             │ 系统调用切换
+             ▼
+┌────────────────────────────┐
+│         Linux 内核（内核态）  │
+│  检查文件描述符               │
+│  如果无数据，阻塞等待 I/O      │
+│  有数据 → 写入内核缓冲区       │
+└────────────┬───────────────┘
+             │ 拷贝数据
+             ▼
+┌────────────────────────────┐
+│ 用户缓冲区 ← 内核缓冲区        │
+│ 返回 read() 调用结果         │
+└────────────────────────────┘
+```
+
+****
+### 2. 阻塞 IO
+
+应用程序想要去读取数据，它是无法直接去读取磁盘数据的，它需要先到内核里边去等待内核操作硬件拿到数据，等到内核从磁盘上把数据加载出来之后，
+再把这个数据写给用户的缓存区，而用户读取数据时，会去先发起 recvform 命令，尝试从内核上加载数据，如果内核没有数据，那么用户就会等待，此时内核会去从硬件上读取数据，
+内核读取数据之后，会把数据拷贝到用户态，并且返回 ok，整个过程，都是阻塞等待的，这就是阻塞 IO
+
+阶段一：
+
+- 用户进程尝试读取数据（比如网卡数据）
+- 此时数据尚未到达，内核需要等待数据
+- 此时用户进程也处于阻塞状态
+
+阶段二：
+
+* 数据到达并拷贝到内核缓冲区，代表已就绪
+* 将内核数据拷贝到用户缓冲区
+* 拷贝过程中，用户进程依然阻塞等待
+* 拷贝完成，用户进程解除阻塞，处理数据
+
+用户进程在以上两个阶段都是处于阻塞状态。
+
+****
+### 3. 非阻塞 IO
+
+顾名思义，非阻塞 IO 的 recvfrom 操作会立即返回结果而不是阻塞用户进程。
+
+阶段一：
+
+* 用户进程尝试读取数据（比如网卡数据）
+* 此时数据尚未到达，内核需要等待数据
+* 返回异常给用户进程
+* 用户进程拿到 error 后，再次尝试读取
+* 循环往复，直到数据就绪
+
+阶段二：
+
+* 将内核数据拷贝到用户缓冲区
+* 拷贝过程中，用户进程依然阻塞等待
+* 拷贝完成，用户进程解除阻塞，处理数据
+
+非阻塞 IO 模型中，用户进程在第一个阶段是非阻塞，第二个阶段是阻塞状态。虽然是非阻塞 IO，但性能并没有得到提高，而且忙等机制会导致 CPU 空转，CPU 使用率暴增。
+
+****
+### 4. IO 多路复用
+
+#### 4.1 定义
+
+无论是阻塞 IO 还是非阻塞 IO，用户应用在一阶段都需要调用 recvfrom 来获取数据，差别在于无数据时的处理方案：
+
+- 如果调用 recvfrom 时，恰好没有数据，阻塞 IO 会使 CPU 阻塞，非阻塞 IO 使 CPU 空转，都不能充分发挥 CPU 的作用。
+- 如果调用 recvfrom 时，恰好有数据，则用户进程可以直接进入第二阶段，读取并处理数据
+
+而在单线程情况下，只能依次处理 IO 事件，如果正在处理的 IO 事件恰好未就绪（数据不可读或不可写），线程就会被阻塞，所有 IO 事件都必须等待，性能自然会很差。
+就比如服务员给顾客点餐，分两步：1、顾客思考要吃什么（等待数据就绪）2、顾客想好了，开始点餐（读取数据）。而提高效率的方法就是增加服务员（多线程）、
+不排队，谁想好了吃什么（数据就绪了），服务员就给谁点餐（用户应用就去读取数据）。而 IO 多路复用就是基于第二种情况，当数据准备好后才开始运行。
+
+文件描述符（File Descriptor）：简称 FD，是一个从 0 开始的无符号整数，用来关联 Linux 中的一个文件。在 Linux 中，一切皆文件，
+例如常规文件、视频、硬件设备等，当然也包括网络套接字（Socket）。通过 FD，网络模型可以利用一个线程监听多个 FD，并在某个 FD 可读、可写时得到通知，
+从而避免无效的等待，充分利用 CPU 资源。
+
+当用户去读取数据的时候，不再去直接调用 recvfrom 了，而是调用 select 的函数，select 函数会将需要监听的数据交给内核，由内核去检查这些数据是否就绪了，
+如果说这个数据就绪了，就会通知应用程序该数据就绪，然后来读取数据，再从内核中把数据拷贝给用户态，完成数据处理，如果 N 多个 FD 一个都没处理完，此时就进行等待。
+用 IO 多路复用模式，可以确保去读数据的时候，数据是一定存在的，它的效率比原来的阻塞 IO 和非阻塞 IO 性能都要高。
+
+阶段一：
+
+* 用户进程调用 select，指定要监听的 FD 集合
+* 核监听 FD 对应的多个 socket
+* 任意一个或多个 socket 数据就绪则返回 readable
+* 此过程中用户进程阻塞
+
+阶段二：
+
+* 用户进程找到就绪的 socket
+* 依次调用 recvfrom 读取数据
+* 内核将数据拷贝到用户空间
+* 用户进程处理数据
+
+IO 多路复用是利用单个线程来同时监听多个 FD，并在某个 FD 可读、可写时得到通知。不过监听 FD 的方式、通知的方式又有多种实现，常见的有：
+
+- select
+- poll
+- epoll
+
+其中 select 和 pool 相当于是当被监听的数据准备好之后，它会把监听的 FD 整个数据都发给用户端，就需要到整个 FD 中去找，
+哪些是处理好了的，需要通过遍历的方式，所以性能也并不是那么好；而 epoll 则相当于内核准备好了之后，它会把准备好的数据，直接发给用户端，可以省去遍历查询的动作。
+
+****
+####  4.2 select 方式
+
+select 是 Linux 最早使用的 IO 多路复用技术。把需要处理的数据封装成 FD，然后在用户态时创建一个 fd 的集合（这个集合的大小是要监听的那个 FD 的最大值 +1），
+这个集合的长度大小是有限制的，同时在这个集合中，标明出来需要控制哪些数据，比如要监听的数据是 1、2、5 三个数据，此时执行 select 函数，然后将整个 fd 发给内核态，
+内核态会去遍历用户态传递过来的数据，如果发现这里边都数据都没有就绪，就休眠，直到有数据准备好时，就会被唤醒，唤醒之后，再次遍历一遍，看看谁准备好了，
+然后再处理掉没有准备好的数据，最后再将这个 FD 集合写回到用户态中去，此时用户态就知道了有数据已经准备好了，但是对于用户态而言，并不知道谁处理好了，
+所以用户态也需要去进行遍历，然后找到对应准备好数据的节点，再去发起读请求。这种模式虽然比阻塞 IO 和非阻塞 IO 好，但是依然效率不高，比如说频繁的传递 fd 集合，
+频繁的去遍历 FD 等，并且限制了监听的 fd 数量，1024 在目前来看是不够用的。
+
+```c
+// 定义类型别名 __fd_mask，本质是 long int 类型
+typedef long int __fd_mask;
+```
+
+fd_set 结构内部是一个 fds_bits 数组，这个数组指定了大小，__FD_SETSIZE 为 1024，__NFDBITS 为 32，所以数组大小为 32，而该数组又是一个 __fd_mask 类型，
+实际上就是一个 long 类型，占 4 字节（32 bit），所以 fds_bits 数组的元素个数为 32 bit，而每一个元素的长度又为 32 bit，所以这个数组整体长度为 1024 bit，
+而保存 fd 时是使用比特位来保存的，所以将来可以保存 1024 个 fd，0 代表未就绪，1 代表就绪，初始全部为 0。
+
+```c
+// fd_set 记录要监听的 fd 集合以及其对应的状态
+typedef struct {
+    // fds_bits 是 long 类型数组，长度为 1024 / 32 = 32
+    // 共 1024 个 bit 位，每个 bit 位代表一个 fd，0 代表未就绪，1 代表就绪
+    __fd_mask fds_bits[__FD_SETSIZE / __NFDBITS];
+    ...
+} fd_set;
+```
+
+```c
+// select 函数，用于监听多个 fd 集合
+int select (
+    int nfds, // 要监听的 fd_set 集合的最大 fd + 1
+    fd_set *readfds, // 要监听的读事件的 fd 集合
+    fd_set *writefds, // 要监听的写事件的 fd 集合
+    fd_set *execeptfds, // 要监听的异常事件的 fd 集合
+    struct timeval *timeout // 超时时间，null 为永不超时；0 为不阻塞等待；大于 0 则为固定等待时间（秒）
+);
+```
+
+```text
+用户空间：
+
+1.1 创建 fd_set rfds 集合，fds_bits 为 00000000
+1.2 监听 1，2，5，此时 fds_bits 数组变为 00010011，从右往左数，1 代表第一位，2 代表第二位。
+1.3 执行 select(5 + 1, rfds, null, null, 3)
+
+3.1 遍历 fds_bits，找到就绪的 fd，读取数据 
+```
+
+```text
+内核空间：当用户空间执行 select 的那一刻，就把 fds_bits 传递过来：00010011
+
+2.1 遍历 fds_bits
+2.2 没有发现已就绪的 fd，休眠（假设没有）
+2.3 等待数据就绪被唤醒或超时
+2.4 此时 fd = 1 数据就绪，遍历 fds_bits，找到被标记监听的 bit 位和 fd = 1 作比较，已就绪的就保留，未就绪的就删除，此时 fds_bits 为 00000001
+2.5 将新 fds_bits 拷贝回用户空间，覆盖旧的 fds_bits
+```
+
+****
+#### 4.3 poll 方式
+
+poll 方式对 select 方式做了简单改进，但性能提升不明显。
+
+```c
+// pollfd 中的事件类型
+#define POLLIN // 可读事件
+#define POLLOUT // 可写事件
+#define POLLERR // 错误事件
+#define POLLNVAL // fd 未打开
+
+// pollfd 结构
+struct pollfd {
+    int fd; // 监听的 fd
+    short int events; // 监听的事件类型
+    short int revents; // 实际发生的事件类型
+}
+
+//poll 函数
+int poll (
+    struct polled *fds, // pollfd 数组，可自定义大小
+    nfds_t nfds, // 数组元素个数
+    int timeout // 超时时间
+);
+```
+
+IO流程：
+
+* 创建 pollfd 数组，向其中添加关注的 fd 信息，数组大小自定义，理论上无上限
+* 调用 poll 函数，将 pollfd 数组拷贝到内核空间，转链表存储，无上限
+* 内核遍历fd，判断是否就绪
+* 数据就绪或超时后，拷贝 pollfd 数组到用户空间，返回就绪 fd 具体数量 n
+* 用户进程判断n是否大于 0，大于 0 则遍历 pollfd 数组，找到就绪的 fd
+
+与 select 对比：
+
+* select 模式中的 fd_set 大小固定为 1024，而 pollfd 在内核中采用链表，理论上无上限
+* 监听 FD 越多，每次遍历消耗时间也越久，性能反而会下降
+
+****
+#### 4.4 epoll 方式
+
+epoll 是对 select 和 poll 的改进，它提供了三个函数：
+
+```c
+struct eventpoll {
+    // ...
+    struct rb_root rbr; // 一个红黑树，记录要监听的 fd
+    struct list_head rdlist; // 一个链表，记录就绪的 fd
+    // ...
+}
+
+// 1. 会在内核创建 eventpoll 结构体，返回对应的句柄 epfd，这个可以看作是 eventpoll 的唯一标识，每个 epfd 指向唯一的一个 eventpoll
+int epoll_create(int size);
+
+// 2. 将一个 fd 添加到 epoll 的红黑树中，并设置 ep_poll_callback
+// callback 触发时，就把对应的 fd 加入到 relist 就绪链表中
+int epoll_ctl(
+    int epfd, // epoll 实例的句柄，唯一标识
+    int op, // 要执行的操作，包括 ADD、MOD、DEL
+    int fd, // 要监听的 fd
+    struct epoll_event *event // 要监听的事件类型：读、写、异常等
+);  
+
+// 3. 检查 rdlist 列表是否为空，不为空则返回就绪的 fd 数量
+int epoll_wait (
+    int epfd, 
+    struct epoll_event *events, // 空 event 数组，用于接收就绪的 fd
+    int maxevents, // events 数组的最大长度
+    itn timeout // 超时时间，-1 不超时、0 不阻塞、大于 0 为阻塞时间
+);
+```
+
+```text
+用户空间：
+
+1. epoll_create(1) 创建 epoll 实例
+2. epoll_ctl() 添加要监听的 fd，关联 callback 函数，一旦 fd 准备就绪旧触发 callback，将就绪的 fd 放到 rdlist 就绪链表中
+3. epoll_wait() 等待 fd 就绪，当初发 callback 时返回 fd 的就绪个数，并将 rdlist 中的数据拷贝到 event 数组中
+4. 接收到就绪个数后，从 event 数组中获取 fd
+```
+
+select 模式存在的三个问题：
+
+* 能监听的 FD 最大不超过 1024
+* 每次 select 都需要把所有要监听的 FD 都拷贝到内核空间
+* 每次都要遍历所有 FD 来判断就绪状态
+
+poll 模式的问题：
+
+* poll 利用链表解决了 select 中监听 FD 上限的问题，但依然要遍历所有 FD，如果监听较多，性能会下降
+
+epoll 模式中如何解决这些问题的？
+
+* 基于 epoll 实例中的红黑树保存要监听的 FD，理论上无上限，而且增删改查效率都非常高
+* 每个 FD 只需要执行一次 epoll_ctl 添加到红黑树，以后每次 epol_wait 无需传递任何参数，无需重复拷贝 FD 到内核空间
+* 利用 ep_poll_callback 机制来监听 FD 状态，无需遍历所有 FD，因此性能不会随监听的 FD 数量增多而下降
+
+****
+#### 4.5 epoll 中的 ET 和 LT 
+
+当 FD 有数据可读时，调用 epoll_wait（或者 select、poll）可以得到通知，但是事件通知的模式有两种：
+
+* LevelTriggered：简称 LT，也叫做水平触发。只要某个 FD 中有数据可读，每次调用 epoll_wait 都会得到通知。
+
+```text
+客户端发送 2KB 数据 →
+服务端 epoll_wait() → 返回 FD 可读
+→ 读取 1KB 数据
+→ 再次 epoll_wait()，FD 仍然返回，因为还有 1KB 没读完
+```
+
+* EdgeTriggered：简称 ET，也叫做边沿触发。只有在某个 FD 有状态变化时，调用 epoll_wait 才会被通知。
+
+```text
+客户端发送 2KB 数据 →
+服务端 epoll_wait() → 返回 FD 可读（状态变化）
+→ 读取 1KB 数据（未读完）
+→ 再次 epoll_wait()，FD 不再返回（因为没有状态变化）
+→ 剩下的 1KB 数据“看不见了”
+```
+
+虽然 ET 模式只在数据第一次到达时通知一次，但是可以通过循环读取数据的方式获取所有的 FD，但需要注意的是，不能使用阻塞 IO 的方式，因为阻塞 IO 的特性是读不到数据了就阻塞等待，
+如果在循环中这样等待，就会造成死循环。
+
+* 假设一个客户端 socket 对应的 FD 已经注册到了 epoll 实例中
+* 客户端 socket 发送了 2kb 的数据
+* 服务端循环调用 epoll_wait，得到通知说 FD 就绪
+* 服务端从 FD 读取了 1kb 数据回到步骤3（再次调用 epoll_wait，形成循环）
+* 处理完后再返回读取完毕的信息
+
+整体流程：
+
+```text
+用户空间：
+
+1.1 服务端调用 epoll_create 创建实例
+1.2 创建 serverSocket 得到 FD，记作 ssfd
+1.3 调用 epoll_ctl 监听 FD
+1.5 调用 epoll_wait 等待 FD 就绪
+1.7 有 FD 就绪后，判断事件类型
+1.9 接收客户端发送的 socke，得到对应的 FD
+```
+
+```text
+内核空间：
+
+1.4 通过 epoll_ctl 监听到的 FD 会放入创建实例时创建的一个红黑树结构中 rb_root
+1.6 当发现 FD 就绪时，就会把 rb_root 中就绪的 FD 放进就绪链表 rd_list 中
+1.8 如果判断出的事件类型为可读类型，就把 rd_list 中的数据拷贝到 event 数组中
+```
+
+****
+### 5. 信号驱动 IO
+
+当内核检测到某个文件描述符（FD）上发生指定事件时，它会主动给用户进程发送一个 SIGIO 信号来通知，而不是让用户程序主动去调用 select、poll、epoll 等阻塞等待。
+
+阶段一：
+
+* 用户进程调用 sigaction，注册信号处理函数
+* 内核返回成功，开始监听 FD
+* 用户进程不阻塞等待，可以执行其它业务
+* 当内核数据就绪后，回调用户进程的 SIGIO 处理函数
+
+阶段二：
+
+* 收到 SIGIO 回调信号
+* 调用 recvfrom，开始阻塞读取
+* 内核将数据拷贝到用户空间
+* 用户进程处理数据
+
+当有大量 IO 操作时，信号较多，SIGIO 处理函数不能及时处理可能导致信号队列溢出，而且内核空间与用户空间的频繁信号交互性能也较低。
+
+****
+### 6. 异步 IO
+
+这种方式不仅仅是用户态在试图读取数据后不阻塞，而且当内核的数据准备完成后，也不会阻塞，它会由内核将所有数据处理完成后，由内核将数据写入到用户态中，
+然后才算完成，所以性能极高，不会有任何阻塞，全部都由内核完成。异步 IO 模型中，用户进程在两个阶段中都是非阻塞状态。
+
+****
+### 7. Redis 单线程
+
+#### 7.1 Redis 是单线程还是多线程
+
+如果仅仅聊 Redis 的核心业务部分（命令处理），那就是单线程；如果是聊整个 Redis，那么就是多线程。在 Redis 版本迭代过程中，在两个重要的时间节点上引入了多线程的支持：
+
+* Redis v4.0：引入多线程异步处理一些耗时较旧的任务，例如异步删除命令 unlink，将删除对象从主线程中剥离，用后台线程异步释放内存；引入 AOF 重写子进程后台完成，但主线程仍处理命令
+* Redis v6.0：在核心网络模型中引入 IO 多线程，进一步提高对于多核 CPU 的利用率
+
+因此，对于 Redis 的核心网络模型，在 Redis 6.0 之前确实都是单线程。是利用 epoll（Linux 系统）这样的 IO 多路复用技术在事件循环中不断处理客户端情况。
+
+为什么 Redis 要选择单线程？
+
+* 抛开持久化不谈，Redis 是纯内存操作，执行速度非常快，它的性能瓶颈是网络延迟而不是执行速度，因此多线程并不会带来巨大的性能提升
+* 多线程会导致过多的上下文切换，带来不必要的开销
+* 引入多线程会面临线程安全问题，必然要引入线程锁这样的安全手段，实现复杂度增高，而且性能也会大打折扣
+
+****
+#### 7.2 Redis 单线程和多线程网络模型变更
+
+Redis 启动后开始初始化网络部分，
+
+```c
+int main (
+    int argc,
+    char **argv
+) {
+    // ... 
+    // 初始化服务
+    initServer();
+    // ...
+    // 开始监听事件循环
+    aeMain(server.el);
+    // ...
+}
+```
+
+通过 aeCreateEventLoop 注册创建事件循环体结构，初始化底层的 IO 多路复用技术，内部会创建 epoll 对象，然后创建服务器 socket 并绑定监听端口，
+并注册 accept 事件处理器，监听 socket，通过 createSocketAcceptHandler 处理服务端的 serverSocket 上发生的事件。所以这一步是在进行准备工作，还没进行相关的处理。
+
+```c
+void initServer(void) {
+    // ...
+    // 内部会调用 aeApiCreate(eventLoop)，类似 epoll_create
+    server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
+    // ...
+    // 监听 TCP 端口，创建 ServerSocket 并得到 FD，传入端口和 IP 地址，默认为本地 IP 127.0.0.1
+    listenToPort(server.port, &server.ipfd);
+    // ...
+    // 注册连接处理器，内部会调用 aeApiAddEvent(&server.ipfd) 监听 FD（将就绪链表中的 FD 添加到 event 数组中）
+    // acceptTcpHandler 用来处理 serverSocket 中的读事件 
+    createSocketAcceptHandler(&server.ipfd, acceptTcpHandler)
+    // 注册 ae_api_poll 前的处理器，在调用 epoll_wait 之前做一些准备工作
+    aeSetBeforeSleepProc(server.el, beforeSleep);
+}
+```
+
+相关服务完成初始化后，再开始执行循环监听事件，也就是等待 FD 就绪。
+
+```c
+void aeMain(aeEventLoop * eventLoop) {
+    eventLoop -> stop = 0;
+    // 循环监听事件
+    while (!eventLoop -> stop) {
+        aeProcessEvents (
+            eventtLoop,
+            AE_ALLEVENTS |
+                AE_CALL_BEFORE_SLEEP | 
+                AE_CALL_AFTER_SLEEP
+        );
+    }
+} 
+```
+
+aeMain 内部循环调用 aeProcessEvents 来处理事件，该方法里面又调用了 aeApiPoll（类似于 epoll_wait），也就是在这体现了等待 FD 的过程
+
+```c
+int aeProcessEvents (aeEventLoop *eventLoop, int flags) {
+    // ... 调用前置处理器 beforeSleep
+    eventLoop -> beforesleep(eventLoop);
+    // 等待 FD 就绪，类似 epoll_wait
+    numevents = aeApiPoll (eventLoop, tvp);
+    for (j = 0; j < numevents; j++) {
+        // 遍历处理就绪的 FD，调用对应事件的处理器
+    }
+}
+```
+
+在初始化的过程中会封装一个数据处理器监听客户端的 socket，而这个里面又会封装一个专门读事件的处理器，读取客户端的 socket 发送来的请求并处理。
+所以当客户端连接到服务端时，就会不断触发 serversocket 的读事件，然后就会调用 acceptTcpHandler 处理器，然后再通过这个处理器里面封装的 readQueryFromClient 处理器接收客户端的请求并处理，
+然后把客户端的 FD 注册到 aeCreateEventLoop 中进行 IO 多路复用
+
+```c
+// 数据处理器
+void acceptTcpHandler(...) {
+    // ...
+    // 接收客户端 socket 连接，获取 FD
+    fd = accept(s, sa, len);
+    // ...
+    // 创建 connection，关联 FD
+    connection *conn = connCreateSocket();
+    conn.fd = fd;
+    // ...
+    // 内部调用 aeApiAddEvent(fd, READABLE)
+    // 监听 socket 的 FD 读事件，并绑定读处理器 readQueryFromClient，处理客户端的读事件
+    connSetReadHandler(conn, readQueryFromClient);
+}
+```
+
+readQueryFromClient 处理器负责将客服端发送的请求放到客户端的缓冲区，然后通过 processCommand 将解析这些请求为 Redis 命令，并获取它们的返回值，
+最后把返回结果写进客户端缓冲区，根据 buf 中是否够用选择是否使用 reply 链表存储。接着就是把这些存储了命令信息的客户端信息放进一个 clients_pending_wirte 队列，
+所以此过程并没有写出响应。
+
+```c
+void readQueryFromClient(connection *conn) {
+    // 获取当前客户端，客户端中有缓存区用来读和写
+    clietn *c = connGetPrivateData(conn);
+    // 获取 c -> querybuf 缓冲区大小
+    long int qblen = sdslen(c -> querybuf);
+    // 读取请求数据到 c -> querybuf 缓冲区
+    connRead(c -> conn, c -> querybuf+qblen, readlen);
+    // ...
+    // 解析缓冲区字符串，转为 Redis 命令参数存入 c -> argv 数组
+    processInputBuffer(c);
+    // ...
+    // 处理 c -> argv 中的命令
+    processCommand(c);
+}
+
+int processCommand(clietn *c) {
+    // ...
+    // 根据命名名称寻找命令对应的 command，例如 setCommand
+    c -> cmd = c -> lastcmd = lookupCommand(c -> argv[0] -> ptr);
+    // ...
+    // 执行 command，得到响应结果，例如 ping 命令，对应 pingCommand
+    c -> cmd -> proc(c);
+    // 把执行结果写出，例如 ping 命令，就返回 pong 给 client；SET 命令就返回 0 或 1
+    // shared.pong 是字符串 “pong” 的 SDS 对象
+    addReply(c, shared.pong);
+}
+
+void addReply(clietn *c, robj *robj) {
+    // 尝试把结果写到 c -> buf 客户端缓冲区
+    if (_addReplyToBuffer(c, obj -> ptr, sdslen(obj -> prtr)) != C_OK)
+        // 如果 c -> buf 写不下，则写到 c -> reply，这是一个链表，容量无上限
+        _addReplyProtoToList(c, obj -> ptr, sdslen(obj -> ptr));
+    // 将客户端添加到 server.clients_pending_write 队列，等待被写出
+    listAddNodeHead(server.clients_pending_wirte,c);
+}
+```
+
+在每次事件循环前会调用 beforeSleep 为需要写出响应的客户端注册写事件处理器，只有当 socket 可写时，即 clients_pending_wirte 队列中有数据时，
+才会使用 sendReplyToClient 写处理器帮助写出响应信息，返回给客户端
+
+```c
+void beforeSleep(struct aeEventLoop *eventLoop) {
+    // ...
+    // 定义迭代器，指向 server.clients_pending_write -> head
+    listIter li;
+    li -> next = server.clients_pending_write -> head;
+    li -> direction = AL_START_HEAD;
+    // 循环遍历待写出的 client
+    while ((len = listNext(&li))) {
+        // 内部调用 aeApiAddEvent(fd, WRITEABLE) 监听 socket 写事件
+        // 并且绑定写处理器 sendReplyToClient，可以把响应写到客户端 socket
+        connSetWriteHandlerWithBarrier(c -> conn, sendReplyToClient, ae_barrier);
+    }
+}
+```
+
+在老版本的 Redis 单线程模型中，客户端与服务端的连接是单线程的，也就是说，Redis 的效率是收网络带宽影响的，再引入多线程后，
+给读与写操作开启了多线程模式，让多个线程并行的解析请求终的数据，但真正执行命令依然是单线程模型，而写出响应时也是让多个线程并行响应，减少因为网络 IO 造成的影响。
+
+****
+
+
 
 
 
