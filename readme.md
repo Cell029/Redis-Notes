@@ -8678,6 +8678,371 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 给读与写操作开启了多线程模式，让多个线程并行的解析请求终的数据，但真正执行命令依然是单线程模型，而写出响应时也是让多个线程并行响应，减少因为网络 IO 造成的影响。
 
 ****
+### 8. Redis 通信协议
+
+#### 8.1 RESP 格式
+
+RESP 是 Redis 自定义的序列化协议，用于客户端与服务端之间的数据交换。它最早引入于 Redis 1.2 版本，从 Redis 2.0 开始成为默认协议（RESP2），
+Redis 6.0 引入 RESP3，但默认仍使用 RESP2。而 RESP 的设计核心是：每种数据类型使用不同的首字节进行标识（数据以 \r\n (CRLF) 作为结束标志）。
+
+1、单行字符串
+
+格式：+<string>\r\n。首字节使用 '+'，后面跟上单行字符串，并以 CRLF（ "\r\n" ）结尾。例如：+OK\r\n 表示字符串 "OK"；+hello world\r\n 表示 "hello world"。
+
+2、错误信息
+
+格式：-<error message>\r\n。首字节使用 '-'，与单行字符串格式一样，只是字符串是异常信息。例如：-WRONGTYPE Operation against a key holding the wrong kind of value\r\n。
+
+3、整数
+
+格式：:<number>\r\n。首字节使用 ':'，后面跟上数字格式的字符串，并以 CRLF（ "\r\n" ）结尾。例如：:1000\r\n 表示整数 1000。
+
+4、多行字符串
+
+格式：$<length>\r\n<bytes>\r\n。首字节使用 '$'，表示二进制安全的字符串，最大支持 512MB，使用数字表示有多少字节的字符串，例如：
+
+- $-1\r\n 表示 NULL 值
+- $0\r\n\r\n 表示空字符串
+- $11\r\nhello\r\nworld\r\n 表示 "hello\r\nworld"
+- $4\r\nball\r\n 表示 "ball"
+
+5、数组
+
+格式：*<number of elements>\r\n<element 1>...<element N>。首字节使用 '*'，后面跟上数组元素个数，再跟上元素，元素数据类型不限:
+
+- *-1\r\n 表示 NULL 数组
+- *0\r\n 表示空数组
+- *3\r\n:1\r\n:2\r\n:3\r\n 表示数组 [1, 2, 3]
+- *5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$6\r\nfoobar\r\n 表示混合类型数组，[1, 2, 3, 4, " foobar"]
+
+```redis
+SET mykey "Hello World"
+*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$11\r\nHello World\r\n
+
+# 成功响应
++OK\r\n
+# 错误响应
+-ERR value is not an integer or out of range\r\n
+# 获取字符串
+$11\r\nHello World\r\n
+# 获取数组
+*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n
+```
+
+****
+#### 8.2 基于 Socket 自定义 Redis 的客户端 
+
+Redis 支持 TCP 通信，因此可以使用 Socket 来模拟客户端，与 Redis 服务端建立连接。
+
+```java
+public class Main {
+    static Socket s;
+    static PrintWriter writer;
+    static BufferedReader reader;
+
+    public static void main(String[] args) {
+        try {
+            // 1. 建立连接
+            String host = "172.23.14.3";
+            int port = 6379;
+            s = new Socket(host, port);
+            // 2. 从 socket 中获取输出流、输入流
+            writer = new PrintWriter(new OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8));
+            reader = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+
+            // 3. 发出请求
+            // 获取授权 auth 123
+            sendRequest("auth", "123");
+            Object obj = handleResponse();
+            System.out.println("obj = " + obj);
+
+            // set name 张三
+            sendRequest("set", "name", "张三");
+            // 4.解析响应
+            obj = handleResponse();
+            System.out.println("obj = " + obj);
+
+            // get name
+            sendRequest("get", "name");
+            obj = handleResponse();
+            System.out.println("obj = " + obj);
+
+            sendRequest("mset", "name", "李四", "age", "20", "address", "江西");
+            obj = handleResponse();
+            System.out.println("obj = " + obj);
+            
+            sendRequest("mget", "name", "age", "address");
+            obj = handleResponse();
+            System.out.println("obj = " + obj);
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            // 5.释放连接
+            try {
+                if (reader != null) reader.close();
+                if (writer != null) writer.close();
+                if (s != null) s.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    // 从 socket 中读取 Redis 返回的数据
+    private static Object handleResponse() throws IOException {
+        // 读取首字节
+        int prefix = reader.read();
+        // 判断数据类型标示
+        switch (prefix) {
+            case '+': // 单行字符串，每个字符串后都会衔接换行符，所以直接读一行
+                return reader.readLine();
+            case '-': // 异常，也读一行
+                throw new RuntimeException(reader.readLine());
+            case ':': // 数字
+                return Long.parseLong(reader.readLine());
+            case '$': // 多行字符串
+                // 先读长度
+                int len = Integer.parseInt(reader.readLine());
+                if (len == -1) {
+                    return null;
+                }
+                if (len == 0) {
+                    return "";
+                }
+                // 再读数据，读 len 个字节。假设没有特殊字符，所以读一行（简化）
+                return reader.readLine();
+            case '*':
+                return readBulkString();
+            default:
+                throw new RuntimeException("错误的数据格式！");
+        }
+    }
+
+    // 读取 Redis 返回的数组信息
+    private static Object readBulkString() throws IOException {
+        // 获取数组大小（行数）
+        int len = Integer.parseInt(reader.readLine());
+        if (len <= 0) {
+            return null;
+        }
+        // 定义集合，接收多个元素
+        List<Object> list = new ArrayList<>(len);
+        // 遍历，依次读取每个元素
+        for (int i = 0; i < len; i++) {
+            // 调用 handleResponse 读取对应的数据，然后封装进集合
+            list.add(handleResponse());
+        }
+        return list;
+    }
+
+    // 将 Redis 命令转换为 RESP 协议格式：SET name 张三 -> *3\r\n$3\r\nSET\r\n$4\r\nname\r\n$6\r\n张三\r\n
+    // 接收多个参数，循环将这些参数进行格式转换，然后写进 socket
+    private static void sendRequest(String ... args) {
+        writer.println("*" + args.length);
+        for (String arg : args) {
+            writer.println("$" + arg.getBytes(StandardCharsets.UTF_8).length);
+            writer.println(arg);
+        }
+        writer.flush();
+    }
+}
+```
+
+****
+### 9. Redis 内存策略
+
+#### 9.1 过期 key 处理
+
+Redis 之所以性能强，最主要的原因就是基于内存存储，然而单节点的 Redis 其内存大小不宜过大，否则会影响持久化或主从同步性能。可以通过修改配置文件来设置 Redis 的最大内存：
+
+```redis
+# 设置最大内存为 1gb
+maxmemory 1gb
+```
+
+当内存使用达到上限时，就无法存储更多数据了，所以 Redis 提供了一些策略实现内存回收：
+
+Redis 中可以通过 expire 命令给 key 设置 TTL（存活时间）：set name jack expire 5（存活时间 5 s），当 key 的 TTL 到期以后，再次访问 name 返回的是 nil，
+说明这个 key 已经不存在了，对应的内存也得到释放，从而起到内存回收的目的。而 Redis 本身是一个典型的 key-value 内存存储数据库，因此所有的 key、value 都保存在 Dict 结构中。
+不过在其 database 结构体中，有两个 Dict：一个用来记录 key-value；另一个用来记录 key-TTL。
+
+```c
+typedef struct redisDb {
+    dict *dict; // 存放所有 key 和 calue 的地方， 也被称为 keyspace
+    dict *expires; // 存放每个 key 及其对应 TTL，只包含设置了 TTL 的 key
+    dict *blocking_keys; // 阻塞等待某个 key 的 client 集合
+    dict *ready_keys; // 当 key 被 push 后，已准备就绪可唤醒的 client 集合
+    dict *watched_keys; /* WATCHED keys for MULTI/EXEC CAS */
+    int id; // 数据库 id
+    long long avg_ttl; // 记录平均 TTL 时间
+    unsigned long expires_cursor; // expire 检查时在 dict 中抽样的索引位置
+    list *defrag_later; // 等待碎片整理的 key 列表
+} redisDb;
+```
+
+虽然 Redis 用了一个 Dict 来存储设置了 TTL 的 key，但并不是 TTL 一到期就立即删除，而是进行惰性删除，也就是在访问某个 key 的时候，检查该 key 的存活时间，如果已经过期才执行删除。
+
+```c
+// 查找 key 执行写操作
+robj *lookupKeyWriteWithFlags(redisDb *db, robj *key, int flags) {
+    expireIfNeeded(db,key);
+    return lookupKey(db,key,flags);
+}
+```
+
+```c
+// 查找 key 执行读操作
+robj *lookupkeyReadWithFlags(redisDb *db, robj *key, int flags) {
+    robj *val;
+    // 检查 key 是否过期
+    if (expireIfNeeded(db, key) == 1) {
+        ...
+    }
+    return NULL;
+}
+```
+
+```c
+int expireIfNeeded(redisDb *db, robj ?*key) {
+    // 判断是否过期，如果未过期直接结束并返回 0
+    if (!keyIsExpired(db, key)) return 0;
+    ...
+    // 删除过期 key
+    deleteExpiredKeyAndPropagate(db, key);
+    return 1;
+}
+```
+
+但惰性删除存在一个问题，就是如果一直不访问的话，那么这个 key 就会一直存在，占用内存，无法达到内存回收的目的，所以 Redis 又引入了周期删除技术，
+通过一个定时任务，周期性的抽样部分过期的 key，然后执行删除。执行周期有两种：
+
+- Redis 服务初始化函数 initServer() 中设置定时任务，按照 server.hz 的频率来执行过期 key 清理，模式为 SLOW
+
+Redis 启动时进行初始化，还会创建一个定时器
+
+```c
+void initServer(void){
+    ...
+    // 创建定时器，关联回调函数 serverCron，处理周期取决于 server.hz，默认为 10
+    aeCreatTimeEvent(server.el, 1, serverCron, NULL, NULL)
+}
+```
+
+然后调用 aeMain 方法循环中，会调用创建好的定时器，检查 key 的 TTL 是否到了，如果到了则执行 serverCron 方法，然后回返回一个默认时间 100ms，
+
+```c
+int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    // 更新 lruclock 到当前时间，为后期的 LRU 和 LFU 做准备
+    unsigned int lruclock = getLRUClock();
+    atomicSet(server.lruclock, lruclock);
+    // 执行 database 的数据清理，例如过期的 key 处理
+    databaseCron();
+    return 1000/server.hz;
+}
+```
+
+```c
+void databaseCron(void) {
+    // 尝试清理部分过期 key，清理模式默认为 SLOW
+    activeExpireCycle(ACTIVE_EXPIRE_CYCLE_SLOW);
+}
+```
+
+- Redis 的每个事件循环前会调用 beforeSleep() 函数，执行过期 key 清理，模式为 FAST
+
+当完成初始化后 Redis 会调用 aeMain 方法开启事件监听，其中就会调用 beforeSleep 方法，不仅创建写处理器，还会尝试清理过期的 key，每经历一次循环就嗲用一次 FAST 模式
+
+```c
+void beforeSleep(struct aeEventLoop *eventloop) {
+    ...
+    // 尝试清理部分过期 key，清理模式默认为 FAST
+    activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
+}
+```
+
+SLOW模式规则：
+
+* 执行频率受server.hz影响，默认为10，即每秒执行10次，每个执行周期100ms。
+* 执行清理耗时不超过一次执行周期的25%.默认slow模式耗时不超过25ms
+* 逐个遍历db，逐个遍历db中的bucket，抽取20个key判断是否过期
+* 如果没达到时间上限（25ms）并且过期key比例大于10%，再进行一次抽样，否则结束
+
+FAST模式规则（过期key比例小于10%不执行 ）：
+
+* 执行频率受beforeSleep()调用频率影响，但两次FAST模式间隔不低于2ms
+* 执行清理耗时不超过1ms
+* 逐个遍历db，逐个遍历db中的bucket，抽取20个key判断是否过期 
+* 如果没达到时间上限（1ms）并且过期key比例大于10%，再进行一次抽样，否则结束
+
+****
+#### 9.2 内存淘汰策略
+
+内存淘汰就是当 Redis 内存使用达到设置的上限时，主动挑选部分 key 删除以释放更多内存的流程。Redis 会在处理客户端命令的方法 processCommand() 中尝试做内存淘汰：
+
+Redis 解析命令的时候会调用下面的方法，但是在真正执行前，会对内存上线进行检查，如果设置了上限，就会尝试进行清理，
+
+```c
+int processCommand(client *c) {
+    // 如果服务器设置了 saerver.maxmemory 属性，并且没有执行 lua 脚本
+    if (saerver.maxmemory && !server.lua_timedout) {
+        // 尝试进行内存淘汰 performEvictions
+        int out_of_memory = (performEvictions() == EVICT_FAIL);
+        ...
+        if (out_of_memory && reject_cmd_on_oom) {
+            rejectCommand(c, shared.oomerr);
+            return C_OK;
+        }
+    }
+}
+```
+
+Redis支持8种不同策略来选择要删除的key：
+
+* noeviction：不淘汰任何key，但是内存满时不允许写入新数据，默认就是这种策略
+* volatile-ttl：对设置了TTL的key，比较key的剩余TTL值，TTL越小越先被淘汰
+* allkeys-random：对全体key ，随机进行淘汰。也就是直接从db->dict中随机挑选
+* volatile-random：对设置了TTL的key ，随机进行淘汰。也就是从db->expires中随机挑选
+* allkeys-lru：对全体key，基于LRU算法进行淘汰
+* volatile-lru：对设置了TTL的key，基于LRU算法进行淘汰
+* allkeys-lfu：对全体key，基于LFU算法进行淘汰
+* volatile-lfu：对设置了TTL的key，基于LFI算法进行淘汰
+  比较容易混淆的有两个：
+    * LRU（Least Recently Used），最少最近使用。用当前时间减去最后一次访问时间，这个值越大则淘汰优先级越高。
+    * LFU（Least Frequently Used），最少频率使用。会统计每个 key 的访问频率，值越小淘汰优先级越高。
+
+Redis 的数据都会被封装为 RedisObject 结构：
+
+```c
+typedef struct redisObject {
+    unsigned type:4;
+    unsigned encoding:4;
+    unsigned lru:LRU_BITS; // LRU:以秒为单位记录最近一次访问时间，长度为 24 bit；LFU：高 16 位以分钟为单位记录最近一次访问时间，低 8 位记录逻辑访问次数
+    int refcount;
+    void *ptr;
+} robj;
+```
+
+LFU 的访问次数之所以叫做逻辑访问次数，是因为并不是每次 key 被访问都计数，而是通过运算：
+
+* 生成 0~1 之间的随机数 R
+* 计算 (旧次数 * lfu_log_factor + 1)，记录为 P，lfu_log_factor 默认 10
+* 如果 R < P ，则计数器 + 1，且最大不超过 255
+* 访问次数会随时间衰减，距离上一次访问时间每隔 lfu_decay_time 分钟（默认 1），计数器 -1
+
+整体流程：
+
+首先会判断内存是否充足，若充足则结束；不充足则会先判断使用的内存策略是否为 noeviction，如果是那就不进行内存淘汰，直接结束；然后判断使用的是 allkeys 还是 volatile，
+allkeys 策略就从 db -> dict 中淘汰，volatile 就从 db -> entries 淘汰；然后判断是否为随机淘汰策略，如果是就直接遍历 db 随机选一个 key 淘汰，然后循环判断内存是否满足需要；
+如果不是就准备一个 evication_pool 淘汰池，因为将来 Redis 中可能存在数以万计的 key，如果还是依次遍历它们的 LRU/LFU/TTL 的值的话效率就太低了，
+所以 Redis 选择从 db 中挑选一些作为样本，然后让它们作比较看谁应该先淘汰（默认挑选 maxmemory_samples 5个），然后从这些样本中进行筛选可以淘汰的 key 放到 evication_pool 池中，
+因为不同的淘汰策略的淘汰标准不一致，所以需要统一放入 evication_pool 池中的规则，所以 Redis 选择让它们按照对应值的升序进行排序放入池中，值大的优先淘汰；例如：
+TTL：用 maxTTL - TTL 作为 idleTime（用设定的存活时间 - 当前剩余存活时间，差值越大证明所剩时间不多了，可以考虑优先淘汰）；
+LRU：用 now - LRU 作为 idleTime（当前时间 - 最近使用时间，这个差值越大证明这个 key 距离上次使用的时间越久，可以考虑优先淘汰）；
+LFU：用 255 - LFU 作为 idleTime（用最大上限 - LFU 当前值，差值越大证明这个 key 使用的频率越低，可以优先考虑淘汰）。
+判断完后依次升序放入 evication_pool 池中，然后倒序从里面获取 key 进行淘汰，接着循环判断是否满足内存需求。
+
+****
+
 
 
 
